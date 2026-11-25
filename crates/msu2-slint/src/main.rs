@@ -238,12 +238,11 @@ async fn main() -> anyhow::Result<()> {
                 "device stopped responding; unplug/replug the screen-side USB to recover",
             )?;
             if let Some(gesture) = button.sample(raw, now) {
-                if cli.verbose {
-                    println!(
-                        "gesture={gesture:?} raw={raw} baseline={}",
-                        button.baseline()
-                    );
-                }
+                println!(
+                    "gesture={gesture:?} raw={raw} baseline={} pressed={}",
+                    button.baseline(),
+                    button.is_pressed()
+                );
                 state.apply(gesture);
             }
             if !calibration_announced && button.is_calibrated() {
