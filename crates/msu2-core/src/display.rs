@@ -1,7 +1,7 @@
 //! 屏幕帧的 tile 差分与流式命令编码。
 //!
-//! 当前设备的 V1.0 固件流式路径尚未验证安全，因此这里的编码器只用于
-//! dry-run 和后续协议实验；不要直接把它接到设备发送路径。
+//! tile 流式路径已在实机验证可用：每页先发 `02 04` 填充字，只对与填充字
+//! 不同的 word 发 `04`，再 flush。不要改回纯 `04` 逐 word 发送，那会卡死固件。
 
 use crate::error::Error;
 use crate::protocol;
@@ -136,8 +136,7 @@ impl TileGrid {
 
 /// 编码一个 tile 的流式发送序列。
 ///
-/// 序列为：设置窗口 → 开始流式 → 每 256 字节 64 个数据帧 + flush → sync。
-/// 这是实验性路径，当前 V1.0 固件可能会卡死，调用方必须显式确认风险。
+/// 序列为：设置窗口 → 开始流式 → 厂商式填充字/差分数据 → flush。
 pub fn encode_tile_stream(frame: &[u16], frame_width: u16, tile: Rect) -> Result<Vec<u8>, Error> {
     if tile.width == 0 || tile.height == 0 {
         return Err(Error::Protocol("tile must be non-empty".to_owned()));
@@ -152,7 +151,7 @@ pub fn encode_tile_stream(frame: &[u16], frame_width: u16, tile: Rect) -> Result
         ));
     }
 
-    let mut packet = Vec::with_capacity(wire_len(tile));
+    let mut packet = Vec::new();
     packet.extend_from_slice(&protocol::lcd_set_xy(tile.x, tile.y));
     packet.extend_from_slice(&protocol::lcd_set_size(tile.width, tile.height));
     packet.extend_from_slice(&protocol::lcd_stream_start());
@@ -166,23 +165,7 @@ pub fn encode_tile_stream(frame: &[u16], frame_width: u16, tile: Rect) -> Result
         }
     }
 
-    for chunk in bytes.chunks(256) {
-        let mut padded = chunk.to_vec();
-        padded.resize(256, 0xFF);
-        for (index, word) in padded.chunks_exact(4).enumerate() {
-            packet.extend_from_slice(&[
-                protocol::CMD_DATA,
-                index as u8,
-                word[0],
-                word[1],
-                word[2],
-                word[3],
-            ]);
-        }
-        packet.extend_from_slice(&protocol::lcd_flush_chunk(chunk.len() as u16));
-    }
-
-    packet.extend_from_slice(&protocol::lcd_sync());
+    packet.extend_from_slice(&encode_rgb565_frame(&bytes, tile.width, tile.height)?);
     Ok(packet)
 }
 
@@ -261,13 +244,6 @@ pub fn encode_rgb565_frame(frame: &[u8], width: u16, height: u16) -> Result<Vec<
     Ok(packet)
 }
 
-/// 一个 tile 的流式序列在 USB 线上占用的字节数。
-pub fn wire_len(tile: Rect) -> usize {
-    let total_bytes = usize::from(tile.width) * usize::from(tile.height) * 2;
-    let chunks = total_bytes.div_ceil(256);
-    3 * 6 + chunks * (64 * 6 + 6) + 6
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,15 +286,16 @@ mod tests {
         };
         let packet = encode_tile_stream(&frame, 160, tile).unwrap();
 
-        assert_eq!(packet.len(), wire_len(tile));
+        // Two 16x16 pages, each a fill word + flush, plus the three setup commands.
+        assert_eq!(packet.len(), 3 * 6 + 2 * 12);
         assert_eq!(&packet[..6], &protocol::lcd_set_xy(16, 16));
         assert_eq!(&packet[6..12], &protocol::lcd_set_size(16, 16));
         assert_eq!(&packet[12..18], &protocol::lcd_stream_start());
         assert_eq!(
             &packet[18..24],
-            &[protocol::CMD_DATA, 0, 0x12, 0x34, 0x12, 0x34]
+            &protocol::lcd_set_fill_word([0x12, 0x34, 0x12, 0x34])
         );
-        assert_eq!(&packet[packet.len() - 6..], &protocol::lcd_sync());
+        assert_eq!(&packet[24..30], &protocol::lcd_flush_chunk(256));
     }
 
     #[test]
