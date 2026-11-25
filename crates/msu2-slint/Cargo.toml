@@ -10,6 +10,7 @@ msu2-core.workspace = true
 slint.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+libc.workspace = true
 clap.workspace = true
 
 [build-dependencies]

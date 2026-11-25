@@ -5,35 +5,178 @@ export component AppWindow inherits Window {
 
     in property <int> page: 0;
     in property <bool> pressed: false;
-    in property <[string]> titles: ["HELLO", "INPUT", "RENDER", "USB"];
-    in property <[string]> subtitles: [
-        "MSU2 160x80 RGB565",
-        "TAP TO CYCLE PAGES",
-        "SLINT SOFTWARE RENDER",
-        "CDC ACM TILE DIFF"
-    ];
+
+    in property <string> clock-time: "--:--:--";
+    in property <string> clock-date: "----.--.--";
+
+    in property <int> cpu-percent: 0;
+    in property <string> cpu-label: "CPU --%";
+    in property <string> cpu-detail: "";
+
+    in property <int> mem-percent: 0;
+    in property <string> mem-label: "MEM --%";
+    in property <string> mem-detail: "";
+
+    in property <string> net-down: "0 B/s";
+    in property <string> net-up: "0 B/s";
+
     in property <[int]> dots: [0, 1, 2, 3];
 
-    Text {
-        x: 0px;
-        y: 12px;
+    // 页 0：时钟
+    if root.page == 0 : Rectangle {
         width: 160px;
-        horizontal-alignment: center;
-        text: root.titles[root.page];
-        color: root.pressed ? #ffffff : #7fe7ff;
-        font-size: 24px;
+        height: 80px;
+        background: transparent;
+
+        Text {
+            x: 0px;
+            y: 8px;
+            width: 160px;
+            horizontal-alignment: center;
+            text: root.clock-time;
+            color: root.pressed ? #ffffff : #7fe7ff;
+            font-size: 30px;
+        }
+
+        Text {
+            x: 0px;
+            y: 50px;
+            width: 160px;
+            horizontal-alignment: center;
+            text: root.clock-date;
+            color: #55707f;
+            font-size: 10px;
+        }
     }
 
-    Text {
-        x: 0px;
-        y: 48px;
+    // 页 1：CPU
+    if root.page == 1 : Rectangle {
         width: 160px;
-        horizontal-alignment: center;
-        text: root.subtitles[root.page];
-        color: #55707f;
-        font-size: 9px;
+        height: 80px;
+        background: transparent;
+
+        Text {
+            x: 0px;
+            y: 6px;
+            width: 160px;
+            horizontal-alignment: center;
+            text: root.cpu-label;
+            color: root.pressed ? #ffffff : #7fe7ff;
+            font-size: 20px;
+        }
+
+        Rectangle {
+            x: 12px;
+            y: 36px;
+            width: 136px;
+            height: 8px;
+            border-radius: 4px;
+            background: #162a38;
+
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                height: parent.height;
+                width: parent.width * root.cpu-percent / 100;
+                border-radius: 4px;
+                background: root.cpu-percent > 80 ? #ff6b6b : #37c8ff;
+            }
+        }
+
+        Text {
+            x: 0px;
+            y: 50px;
+            width: 160px;
+            horizontal-alignment: center;
+            text: root.cpu-detail;
+            color: #55707f;
+            font-size: 9px;
+        }
     }
 
+    // 页 2：内存
+    if root.page == 2 : Rectangle {
+        width: 160px;
+        height: 80px;
+        background: transparent;
+
+        Text {
+            x: 0px;
+            y: 6px;
+            width: 160px;
+            horizontal-alignment: center;
+            text: root.mem-label;
+            color: root.pressed ? #ffffff : #7fe7ff;
+            font-size: 20px;
+        }
+
+        Rectangle {
+            x: 12px;
+            y: 36px;
+            width: 136px;
+            height: 8px;
+            border-radius: 4px;
+            background: #162a38;
+
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                height: parent.height;
+                width: parent.width * root.mem-percent / 100;
+                border-radius: 4px;
+                background: root.mem-percent > 80 ? #ff6b6b : #37c8ff;
+            }
+        }
+
+        Text {
+            x: 0px;
+            y: 50px;
+            width: 160px;
+            horizontal-alignment: center;
+            text: root.mem-detail;
+            color: #55707f;
+            font-size: 9px;
+        }
+    }
+
+    // 页 3：网络
+    if root.page == 3 : Rectangle {
+        width: 160px;
+        height: 80px;
+        background: transparent;
+
+        Text {
+            x: 0px;
+            y: 4px;
+            width: 160px;
+            horizontal-alignment: center;
+            text: "NET";
+            color: root.pressed ? #ffffff : #7fe7ff;
+            font-size: 18px;
+        }
+
+        Text {
+            x: 0px;
+            y: 30px;
+            width: 160px;
+            horizontal-alignment: center;
+            text: "DOWN  " + root.net-down;
+            color: #55707f;
+            font-size: 10px;
+        }
+
+        Text {
+            x: 0px;
+            y: 48px;
+            width: 160px;
+            horizontal-alignment: center;
+            text: "UP    " + root.net-up;
+            color: #55707f;
+            font-size: 10px;
+        }
+    }
+
+    // 页码
     HorizontalLayout {
         x: 0px;
         y: 68px;

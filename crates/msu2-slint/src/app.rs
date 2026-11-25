@@ -1,4 +1,4 @@
-//! Slint 窗口适配器、页面状态和统计。
+//! Slint 窗口适配器、页面状态和 UI 刷新。
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -7,6 +7,7 @@ use msu2_core::ButtonState;
 use slint::platform::software_renderer::MinimalSoftwareWindow;
 use slint::platform::{Platform, WindowAdapter};
 
+use crate::metrics::Metrics;
 use crate::{AppWindow, PAGES};
 
 pub(crate) struct HeadlessPlatform {
@@ -44,6 +45,7 @@ pub(crate) struct Stats {
     pub(crate) dirty_tiles: u64,
     pub(crate) rects: u64,
     pub(crate) bytes: u64,
+    pub(crate) reconnects: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +63,22 @@ impl AppState {
     }
 }
 
-pub(crate) fn refresh_ui(ui: &AppWindow, state: &AppState, button: &ButtonState) {
+/// 每帧刷新：页码和按下高亮。
+pub(crate) fn refresh_page(ui: &AppWindow, state: &AppState, button: &ButtonState) {
     ui.set_page(state.page as i32);
     ui.set_pressed(button.is_pressed());
+}
+
+/// 每秒刷新：时间、负载和速率。
+pub(crate) fn refresh_metrics(ui: &AppWindow, metrics: &Metrics) {
+    ui.set_clock_time(metrics.time.clone().into());
+    ui.set_clock_date(metrics.date.clone().into());
+    ui.set_cpu_label(format!("CPU {}%", metrics.cpu_percent).into());
+    ui.set_cpu_percent(i32::from(metrics.cpu_percent));
+    ui.set_cpu_detail(metrics.cpu_detail.clone().into());
+    ui.set_mem_label(format!("MEM {}%", metrics.mem_percent).into());
+    ui.set_mem_percent(i32::from(metrics.mem_percent));
+    ui.set_mem_detail(metrics.mem_detail.clone().into());
+    ui.set_net_down(metrics.net_down.clone().into());
+    ui.set_net_up(metrics.net_up.clone().into());
 }

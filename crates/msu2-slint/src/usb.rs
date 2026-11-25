@@ -1,4 +1,6 @@
-//! USB 连接与帧发送。
+//! USB 连接、重连与帧发送。
+
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use msu2_core::display::{Rect, rgb565_bytes};
@@ -8,7 +10,8 @@ use slint::platform::software_renderer::Rgb565Pixel;
 use crate::Cli;
 use crate::{BAUDRATE, CONNECT_TIMEOUT, HEIGHT, WIDTH};
 
-pub(crate) async fn connect(cli: &Cli) -> anyhow::Result<Msu2Device> {
+/// 建立一次连接；失败时直接返回错误，由调用方决定是否重试。
+async fn connect_once(cli: &Cli) -> anyhow::Result<Msu2Device> {
     let mut device = match &cli.port {
         Some(port) => Msu2Device::connect(port.clone(), BAUDRATE, CONNECT_TIMEOUT)
             .await
@@ -21,8 +24,34 @@ pub(crate) async fn connect(cli: &Cli) -> anyhow::Result<Msu2Device> {
         .initialize()
         .await
         .context("failed to initialize MSU2")?;
-    println!("connected to {}", device.path());
     Ok(device)
+}
+
+/// 带退避的连接循环，直到成功或用户按 Ctrl-C。
+pub(crate) async fn connect(cli: &Cli) -> anyhow::Result<Msu2Device> {
+    let mut delay = Duration::from_millis(500);
+
+    loop {
+        match connect_once(cli).await {
+            Ok(device) => {
+                println!("connected to {}", device.path());
+                return Ok(device);
+            }
+            Err(error) => {
+                eprintln!("connect failed: {error:#}; retrying in {delay:?}");
+            }
+        }
+
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.ok();
+                anyhow::bail!("interrupted while reconnecting");
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
+
+        delay = (delay * 2).min(Duration::from_secs(5));
+    }
 }
 
 pub(crate) fn copy_pixels(pixels: &[Rgb565Pixel], out: &mut [u16]) {
