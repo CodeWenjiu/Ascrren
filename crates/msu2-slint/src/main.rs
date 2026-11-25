@@ -76,6 +76,10 @@ struct Cli {
     #[arg(long, default_value_t = 3)]
     median_window: u8,
 
+    /// 释放后多久内忽略新的按下（毫秒），抑制焊盘回弹
+    #[arg(long, default_value_t = 250)]
+    release_lockout_ms: u64,
+
     /// 长按阈值（毫秒）
     #[arg(long, default_value_t = 600)]
     long_ms: u64,
@@ -203,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
         press_delta: cli.press_delta,
         release_delta: (u32::from(cli.press_delta) * 2 / 3) as u16,
         median_window: cli.median_window,
+        release_lockout: Duration::from_millis(cli.release_lockout_ms),
         long_press: Duration::from_millis(cli.long_ms),
         very_long_press: Duration::from_millis(cli.very_long_ms),
         track_baseline: cli.track_baseline,

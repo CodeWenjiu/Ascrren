@@ -44,6 +44,10 @@ pub struct ButtonConfig {
     ///
     /// 窗口越大越能抑制单点噪声，但会多延迟约半个窗口的采样。
     pub median_window: u8,
+    /// 释放后多久内忽略新的按下。
+    ///
+    /// 电容焊盘松手后会在阈值上方反弹，不加锁定会连续触发点击。
+    pub release_lockout: Duration,
     /// 是否在空闲时跟踪基线漂移。
     ///
     /// 默认关闭——ADC 噪声会让 EMA 随机游走，反而使阈值漂移。
@@ -63,6 +67,7 @@ impl Default for ButtonConfig {
             debounce_samples: 2,
             release_debounce_samples: 2,
             median_window: 3,
+            release_lockout: Duration::from_millis(250),
             track_baseline: false,
             baseline_ema_shift: 6,
         }
@@ -106,6 +111,7 @@ pub struct ButtonState {
     candidate: Option<bool>,
     candidate_samples: u8,
     candidate_since: Option<Instant>,
+    last_release: Option<Instant>,
 }
 
 impl ButtonState {
@@ -122,6 +128,7 @@ impl ButtonState {
             candidate: None,
             candidate_samples: 0,
             candidate_since: None,
+            last_release: None,
         }
     }
 
@@ -197,9 +204,16 @@ impl ButtonState {
         }
 
         let baseline = self.baseline;
-        let raw_pressed = match self.phase {
-            Phase::Pressed { .. } => u32::from(raw) < self.config.release_threshold(baseline),
-            _ => u32::from(raw) < self.config.press_threshold(baseline),
+        let locked = self.last_release.is_some_and(|released| {
+            now.saturating_duration_since(released) < self.config.release_lockout
+        });
+        let raw_pressed = if locked {
+            false
+        } else {
+            match self.phase {
+                Phase::Pressed { .. } => u32::from(raw) < self.config.release_threshold(baseline),
+                _ => u32::from(raw) < self.config.press_threshold(baseline),
+            }
         };
 
         if self.candidate == Some(raw_pressed) {
@@ -232,6 +246,7 @@ impl ButtonState {
                 (Phase::Pressed { long_fired, .. }, false) => {
                     self.phase = Phase::Idle;
                     self.candidate_samples = 0;
+                    self.last_release = Some(now);
                     if !long_fired {
                         return Some(Gesture::Click);
                     }
@@ -424,6 +439,22 @@ mod tests {
         assert_eq!(state.last_filtered(), 700);
         state.sample(700, at(start, 30));
         assert!(state.is_pressed());
+    }
+
+    #[test]
+    fn release_lockout_swallows_bounce_back() {
+        let (mut state, start) = calibrated();
+
+        state.sample(800, start);
+        state.sample(800, at(start, 10));
+        state.sample(1000, at(start, 100));
+        assert_eq!(state.sample(1000, at(start, 110)), Some(Gesture::Click));
+
+        // 松手后值回弹到阈值以下，但还在 250 ms 锁定期内。
+        for offset in [140, 150, 160, 170] {
+            assert_eq!(state.sample(800, at(start, offset)), None);
+        }
+        assert!(!state.is_pressed());
     }
 
     #[test]
