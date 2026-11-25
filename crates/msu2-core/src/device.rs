@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::display::encode_rgb565_frame;
+use crate::display::{Rect, encode_rgb565_frame, encode_tiles};
 use crate::error::Error;
 use crate::protocol::{self, Frame};
 use crate::sfr::{SfrKind, SfrTable, SfrValue};
@@ -301,6 +301,29 @@ impl<T: Transport> Msu2Device<T> {
             remaining -= u32::from(chunk);
         }
         self.transport.send(&packet).await
+    }
+
+    /// 增量刷新一组矩形区域。
+    ///
+    /// 每个矩形都会被编码成独立的窗口设置 + 流式数据 + flush 序列，所有
+    /// 序列首尾相接合并成一次 USB 写入。调用方负责只传入真正变化的区域
+    /// （例如 `TileGrid::diff` + `TileGrid::merge_tiles` 的结果）。
+    ///
+    /// 返回总线上实际发送的字节数。
+    pub async fn stream_tiles(
+        &mut self,
+        frame: &[u16],
+        frame_width: u16,
+        tiles: &[Rect],
+    ) -> Result<usize, Error> {
+        if tiles.is_empty() {
+            return Ok(0);
+        }
+
+        let packet = encode_tiles(frame, frame_width, tiles)?;
+        let bytes = packet.len();
+        self.transport.send(&packet).await?;
+        Ok(bytes)
     }
 
     /// 将一整帧 RGB565 数据流式发送到屏幕。

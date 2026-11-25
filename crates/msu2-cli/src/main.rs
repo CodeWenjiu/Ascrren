@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+use msu2_core::display::TileGrid;
 use msu2_core::{Frame, Msu2Device, SfrValue};
 
 #[derive(Debug, Parser)]
@@ -102,6 +103,29 @@ enum Command {
         /// 发送后保持连接的时长（毫秒）
         #[arg(long, default_value_t = 0)]
         hold_ms: u64,
+    },
+
+    /// 用增量 tile 刷新驱动一个移动方块，验证更新路径并测量实际吞吐
+    Animate {
+        /// 运行时长（毫秒）
+        #[arg(long, default_value_t = 10_000)]
+        duration_ms: u64,
+
+        /// 每帧之间的停顿（毫秒）；0 表示全速发送
+        #[arg(long, default_value_t = 0)]
+        step_ms: u64,
+
+        /// 方块边长（像素）
+        #[arg(long, default_value_t = 24)]
+        block: u16,
+
+        /// 每帧移动的像素数
+        #[arg(long, default_value_t = 4)]
+        speed: u16,
+
+        /// 明知增量刷新仍是实验路径仍要尝试
+        #[arg(long)]
+        force: bool,
     },
 
     /// 显示外部 Flash 中预存的彩色图片
@@ -341,6 +365,22 @@ async fn run() -> anyhow::Result<()> {
                 hold_ms,
             )
             .await
+        }
+        Command::Animate {
+            duration_ms,
+            step_ms,
+            block,
+            speed,
+            force,
+        } => {
+            let mut device = connect(&cli).await?;
+            let spec = AnimateSpec {
+                duration_ms,
+                step_ms,
+                block,
+                speed,
+            };
+            cmd_animate(&mut device, &spec, force).await
         }
         Command::Photo {
             page,
@@ -660,6 +700,134 @@ async fn cmd_frame(
     );
     hold_session(device, hold_ms).await?;
     Ok(())
+}
+
+struct AnimateSpec {
+    duration_ms: u64,
+    step_ms: u64,
+    block: u16,
+    speed: u16,
+}
+
+/// 在一个长驻的 framebuffer 上移动方块，只发送变化的 tile。
+///
+/// 这是 GUI 增量刷新的最小模拟：每帧重建目标画面，与上一帧做 tile
+/// 差分并合并矩形，再通过 `stream_tiles` 一次写入 USB。
+async fn cmd_animate(
+    device: &mut Msu2Device,
+    spec: &AnimateSpec,
+    force: bool,
+) -> anyhow::Result<()> {
+    if !force {
+        bail!("incremental tile streaming is still experimental; pass --force to try it");
+    }
+
+    const WIDTH: usize = 160;
+    const HEIGHT: usize = 80;
+    const TILE: u16 = 16;
+
+    let block = spec.block.max(TILE);
+    if usize::from(block) > WIDTH {
+        bail!("--block must be at most {WIDTH}");
+    }
+    let speed = spec.speed.max(1) as i32;
+    let grid =
+        TileGrid::new(WIDTH as u16, HEIGHT as u16, TILE).context("failed to build tile grid")?;
+
+    let mut frame = vec![0u16; WIDTH * HEIGHT];
+    device
+        .initialize()
+        .await
+        .context("failed to initialize MSU2")?;
+    device
+        .display_frame(0, 0, WIDTH as u16, HEIGHT as u16, &rgb565_bytes(&frame))
+        .await
+        .context("failed to draw the initial frame")?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    println!(
+        "initial frame sent; animating for {} ms (block {block}px, speed {speed}px/frame)",
+        spec.duration_ms
+    );
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(spec.duration_ms);
+    let mut previous = frame.clone();
+    let mut frames = 0u64;
+    let mut sent_bytes = 0u64;
+    let mut dirty_tiles_total = 0u64;
+    let mut rects_total = 0u64;
+    let mut position = 0i32;
+    let mut direction = 1i32;
+    let mut failures = 0u32;
+
+    while Instant::now() < deadline {
+        frame.fill(0);
+        for row in 0..usize::from(block) {
+            let y = 16 + row;
+            if y >= HEIGHT {
+                break;
+            }
+            let start = position.max(0) as usize;
+            let end = (position + i32::from(block)).clamp(0, WIDTH as i32) as usize;
+            frame[y * WIDTH + start..y * WIDTH + end].fill(0xF800);
+        }
+
+        let dirty = grid.diff(&previous, &frame).context("tile diff failed")?;
+        if !dirty.is_empty() {
+            let rects = grid.merge_tiles(&dirty);
+            match device.stream_tiles(&frame, WIDTH as u16, &rects).await {
+                Ok(bytes) => {
+                    failures = 0;
+                    sent_bytes += bytes as u64;
+                    dirty_tiles_total += dirty.len() as u64;
+                    rects_total += rects.len() as u64;
+                    frames += 1;
+                    previous.copy_from_slice(&frame);
+                }
+                Err(error) => {
+                    failures += 1;
+                    if failures >= 2 {
+                        bail!(
+                            "device stopped responding after tile update ({error}); \
+                             unplug/replug the screen-side USB to recover"
+                        );
+                    }
+                }
+            }
+        }
+
+        position += speed * direction;
+        if position <= 0 {
+            position = 0;
+            direction = 1;
+        } else if position + i32::from(block) >= WIDTH as i32 {
+            position = WIDTH as i32 - i32::from(block);
+            direction = -1;
+        }
+
+        if spec.step_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(spec.step_ms)).await;
+        }
+    }
+
+    let elapsed = started.elapsed().as_secs_f64();
+    println!(
+        "animated {frames} frames in {elapsed:.2}s ({:.1} fps)",
+        frames as f64 / elapsed.max(f64::EPSILON)
+    );
+    println!(
+        "tile updates={dirty_tiles_total} merged rects={rects_total} wire_bytes={sent_bytes} ({:.0} B/frame)",
+        sent_bytes as f64 / frames.max(1) as f64
+    );
+    Ok(())
+}
+
+fn rgb565_bytes(frame: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(frame.len() * 2);
+    for pixel in frame {
+        bytes.extend_from_slice(&pixel.to_be_bytes());
+    }
+    bytes
 }
 
 async fn hold_session(device: &mut Msu2Device, hold_ms: u64) -> anyhow::Result<()> {

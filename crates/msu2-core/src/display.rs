@@ -3,6 +3,8 @@
 //! tile 流式路径已在实机验证可用：每页先发 `02 04` 填充字，只对与填充字
 //! 不同的 word 发 `04`，再 flush。不要改回纯 `04` 逐 word 发送，那会卡死固件。
 
+use std::collections::HashMap;
+
 use crate::error::Error;
 use crate::protocol;
 
@@ -97,6 +99,83 @@ impl TileGrid {
         }
     }
 
+    /// 把脏 tile 合并成尽量少的像素矩形。
+    ///
+    /// 先按行合并相邻 tile，再把行号连续且水平范围相同的段叠成矩形。
+    /// 合并后的宽高仍是 tile 尺寸的整数倍，因此数据量始终按 256 字节页
+    /// 对齐，不会掉进尾部不满页的低效路径。
+    pub fn merge_tiles(&self, tiles: &[Tile]) -> Vec<Rect> {
+        if tiles.is_empty() {
+            return Vec::new();
+        }
+
+        let tiles_x = usize::from(self.tiles_x);
+        let mut dirty = vec![false; tiles_x * usize::from(self.tiles_y)];
+        for tile in tiles {
+            let (x, y) = (usize::from(tile.x), usize::from(tile.y));
+            if x < tiles_x && y < usize::from(self.tiles_y) {
+                dirty[y * tiles_x + x] = true;
+            }
+        }
+
+        // 每一行内把连续脏 tile 合成一个水平段。
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        for y in 0..usize::from(self.tiles_y) {
+            let row = &dirty[y * tiles_x..(y + 1) * tiles_x];
+            let mut x = 0;
+            while x < row.len() {
+                if !row[x] {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < row.len() && row[x] {
+                    x += 1;
+                }
+                runs.push((start, x, y));
+            }
+        }
+
+        // 相同水平范围、连续行号的段继续向下延伸。逐行推进保证空行会
+        // 断开合并。
+        let mut merged: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut previous_row: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut cursor = 0usize;
+        for y in 0..usize::from(self.tiles_y) {
+            let mut current_row: HashMap<(usize, usize), usize> = HashMap::new();
+            while cursor < runs.len() && runs[cursor].2 == y {
+                let (x0, x1, _) = runs[cursor];
+                if let Some(&index) = previous_row.get(&(x0, x1)) {
+                    merged[index].3 = y + 1;
+                    current_row.insert((x0, x1), index);
+                } else {
+                    merged.push((x0, x1, y, y + 1));
+                    current_row.insert((x0, x1), merged.len() - 1);
+                }
+                cursor += 1;
+            }
+            previous_row = current_row;
+        }
+
+        merged
+            .into_iter()
+            .map(|(x0, x1, y0, y1)| self.tile_span_rect(x0, x1, y0, y1))
+            .collect()
+    }
+
+    fn tile_span_rect(&self, x0: usize, x1: usize, y0: usize, y1: usize) -> Rect {
+        let x = (x0 as u16).saturating_mul(self.tile_size);
+        let y = (y0 as u16).saturating_mul(self.tile_size);
+        let right = ((x1 as u16).saturating_mul(self.tile_size)).min(self.width);
+        let bottom = ((y1 as u16).saturating_mul(self.tile_size)).min(self.height);
+        Rect {
+            x,
+            y,
+            width: right.saturating_sub(x),
+            height: bottom.saturating_sub(y),
+        }
+    }
+
     /// 返回发生变化的 tile。两个 framebuffer 都必须是 RGB565，长度严格等于
     /// `width * height`。
     pub fn diff(&self, previous: &[u16], current: &[u16]) -> Result<Vec<Tile>, Error> {
@@ -166,6 +245,16 @@ pub fn encode_tile_stream(frame: &[u16], frame_width: u16, tile: Rect) -> Result
     }
 
     packet.extend_from_slice(&encode_rgb565_frame(&bytes, tile.width, tile.height)?);
+    Ok(packet)
+}
+
+/// 把多个矩形编码成一个连续 packet，每个矩形仍保留自己的窗口设置和
+/// `stream_start`。多个矩形合并成一次 USB 写入可显著减少传输次数。
+pub fn encode_tiles(frame: &[u16], frame_width: u16, tiles: &[Rect]) -> Result<Vec<u8>, Error> {
+    let mut packet = Vec::new();
+    for tile in tiles {
+        packet.extend_from_slice(&encode_tile_stream(frame, frame_width, *tile)?);
+    }
     Ok(packet)
 }
 
@@ -338,6 +427,72 @@ mod tests {
             &packet[first_page_end..first_page_end + 6],
             &protocol::lcd_set_fill_word([0x12, 0x34, 0x12, 0x34])
         );
+    }
+
+    #[test]
+    fn merges_horizontal_and_vertical_tile_runs() {
+        let grid = TileGrid::new(160, 80, 16).unwrap();
+        let tiles = vec![
+            Tile { x: 1, y: 2 },
+            Tile { x: 2, y: 2 },
+            Tile { x: 1, y: 3 },
+            Tile { x: 2, y: 3 },
+            Tile { x: 7, y: 0 },
+        ];
+        let mut rects = grid.merge_tiles(&tiles);
+        rects.sort_by_key(|rect| (rect.y, rect.x));
+
+        assert_eq!(
+            rects,
+            vec![
+                Rect {
+                    x: 112,
+                    y: 0,
+                    width: 16,
+                    height: 16,
+                },
+                Rect {
+                    x: 16,
+                    y: 32,
+                    width: 32,
+                    height: 32,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_keeps_non_adjacent_rows_apart() {
+        let grid = TileGrid::new(160, 80, 16).unwrap();
+        let rects = grid.merge_tiles(&[
+            Tile { x: 0, y: 0 },
+            Tile { x: 0, y: 2 },
+            Tile { x: 0, y: 3 },
+        ]);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].height, 16);
+        assert_eq!(rects[1].height, 32);
+    }
+
+    #[test]
+    fn merged_rects_stay_page_aligned() {
+        let grid = TileGrid::new(160, 80, 16).unwrap();
+        let mut tiles = Vec::new();
+        for y in 0..5 {
+            for x in 0..10 {
+                if (x * 7 + y * 3) % 4 == 0 {
+                    tiles.push(Tile { x, y });
+                }
+            }
+        }
+
+        // 末尾半行/半列不是 tile 整数倍时可能不满页，这里只检查内部 tile。
+        for rect in grid.merge_tiles(&tiles) {
+            assert_eq!(rect.width % 16, 0);
+            assert_eq!(rect.height % 16, 0);
+            let bytes = usize::from(rect.width) * usize::from(rect.height) * 2;
+            assert_eq!(bytes % 256, 0, "rect {rect:?} is not page aligned");
+        }
     }
 
     #[test]
