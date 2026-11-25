@@ -123,6 +123,10 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         speed: u16,
 
+        /// 把相邻脏 tile 合并成矩形并一次写入（更快，但合并序列尚未在实机验证）
+        #[arg(long)]
+        merge: bool,
+
         /// 明知增量刷新仍是实验路径仍要尝试
         #[arg(long)]
         force: bool,
@@ -371,6 +375,7 @@ async fn run() -> anyhow::Result<()> {
             step_ms,
             block,
             speed,
+            merge,
             force,
         } => {
             let mut device = connect(&cli).await?;
@@ -379,6 +384,7 @@ async fn run() -> anyhow::Result<()> {
                 step_ms,
                 block,
                 speed,
+                merge,
             };
             cmd_animate(&mut device, &spec, force).await
         }
@@ -707,7 +713,11 @@ struct AnimateSpec {
     step_ms: u64,
     block: u16,
     speed: u16,
+    merge: bool,
 }
+
+/// 单次增量写入的最长等待时间。固件卡死时写操作会因 USB 流控永久阻塞。
+const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 在一个长驻的 framebuffer 上移动方块，只发送变化的 tile。
 ///
@@ -745,8 +755,13 @@ async fn cmd_animate(
         .context("failed to draw the initial frame")?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     println!(
-        "initial frame sent; animating for {} ms (block {block}px, speed {speed}px/frame)",
-        spec.duration_ms
+        "initial frame sent; animating for {} ms (block {block}px, speed {speed}px/frame, {})",
+        spec.duration_ms,
+        if spec.merge {
+            "merged rects"
+        } else {
+            "per-tile"
+        }
     );
 
     let started = Instant::now();
@@ -774,13 +789,54 @@ async fn cmd_animate(
 
         let dirty = grid.diff(&previous, &frame).context("tile diff failed")?;
         if !dirty.is_empty() {
-            let rects = grid.merge_tiles(&dirty);
-            match device.stream_tiles(&frame, WIDTH as u16, &rects).await {
-                Ok(bytes) => {
+            let result = if spec.merge {
+                let rects = grid.merge_tiles(&dirty);
+                rects_total += rects.len() as u64;
+                match tokio::time::timeout(
+                    SEND_TIMEOUT,
+                    device.stream_tiles(&frame, WIDTH as u16, &rects),
+                )
+                .await
+                {
+                    Ok(result) => result.map(|bytes| (bytes, rects.len())),
+                    Err(_) => bail!(
+                        "tile write timed out after {SEND_TIMEOUT:?}; \
+                         firmware likely hung, unplug/replug the screen-side USB"
+                    ),
+                }
+            } else {
+                // 保守模式：每个 tile 单独一次写入，避免未验证的合并序列。
+                let mut bytes = 0usize;
+                let mut result = Ok(());
+                for tile in &dirty {
+                    match tokio::time::timeout(
+                        SEND_TIMEOUT,
+                        device.stream_tiles(&frame, WIDTH as u16, &[grid.tile_rect(*tile)]),
+                    )
+                    .await
+                    {
+                        Ok(Ok(sent)) => bytes += sent,
+                        Ok(Err(error)) => {
+                            result = Err(error);
+                            break;
+                        }
+                        Err(_) => bail!(
+                            "tile write timed out after {SEND_TIMEOUT:?}; \
+                             firmware likely hung, unplug/replug the screen-side USB"
+                        ),
+                    }
+                }
+                result.map(|()| (bytes, dirty.len()))
+            };
+
+            match result {
+                Ok((bytes, count)) => {
                     failures = 0;
                     sent_bytes += bytes as u64;
                     dirty_tiles_total += dirty.len() as u64;
-                    rects_total += rects.len() as u64;
+                    if !spec.merge {
+                        rects_total += count as u64;
+                    }
                     frames += 1;
                     previous.copy_from_slice(&frame);
                 }
