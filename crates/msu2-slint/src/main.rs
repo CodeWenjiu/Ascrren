@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use msu2_core::display::{DISPLAY_HEIGHT, DISPLAY_WIDTH, Rect, TileGrid, rgb565_bytes};
-use msu2_core::{Msu2Device, STREAM_TIMEOUT};
+use msu2_core::{ButtonConfig, ButtonState, Gesture, Msu2Device, STREAM_TIMEOUT};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, WindowAdapter};
 
@@ -26,8 +26,8 @@ const WIDTH: usize = DISPLAY_WIDTH as usize;
 const HEIGHT: usize = DISPLAY_HEIGHT as usize;
 const TILE_SIZE: u16 = 16;
 
-/// 没有画面更新时，多久发一次读命令保活。
-const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
+/// 列表页的可选项。
+const ITEMS: [&str; 3] = ["Clock", "System", "Settings"];
 
 #[derive(Debug, Parser)]
 #[command(name = "msu2-slint", about = "把 Slint 界面实时镜像到 MSU2 副屏")]
@@ -63,6 +63,22 @@ struct Cli {
     /// 退出时把最后一帧写成 BMP
     #[arg(long, value_name = "FILE")]
     dump_bmp: Option<std::path::PathBuf>,
+
+    /// 每 N 帧采样一次按键；60 fps 下默认为 30 Hz
+    #[arg(long, default_value_t = 2)]
+    sample_divisor: u64,
+
+    /// 判定按下的下降幅度（相对基线）；灵敏度不够时调小
+    #[arg(long, default_value_t = 125)]
+    press_delta: u16,
+
+    /// 长按阈值（毫秒）
+    #[arg(long, default_value_t = 350)]
+    long_ms: u64,
+
+    /// 超长按阈值（毫秒）
+    #[arg(long, default_value_t = 1200)]
+    very_long_ms: u64,
 }
 
 struct HeadlessPlatform {
@@ -93,6 +109,52 @@ struct Stats {
     bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    List,
+    Detail,
+}
+
+struct AppState {
+    page: Page,
+    focus: usize,
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            page: Page::List,
+            focus: 0,
+        }
+    }
+
+    fn apply(&mut self, gesture: Gesture) {
+        match gesture {
+            Gesture::Click => match self.page {
+                Page::List => self.focus = (self.focus + 1) % ITEMS.len(),
+                Page::Detail => self.page = Page::List,
+            },
+            Gesture::LongPress => {
+                if self.page == Page::List {
+                    self.page = Page::Detail;
+                }
+            }
+            Gesture::VeryLongPress => self.page = Page::List,
+        }
+    }
+}
+
+fn refresh_ui(ui: &AppWindow, state: &AppState, button: &ButtonState, now: Instant) {
+    ui.set_page(match state.page {
+        Page::List => 0,
+        Page::Detail => 1,
+    });
+    ui.set_selected(state.focus as i32);
+    ui.set_detail_title(ITEMS[state.focus].into());
+    ui.set_pressed(button.is_pressed());
+    ui.set_hold_progress(button.hold_progress(now));
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -121,8 +183,17 @@ async fn main() -> anyhow::Result<()> {
     let mut previous = vec![0u16; WIDTH * HEIGHT];
 
     // 先渲染并发送一整帧，后续只发差分。
+    let mut state = AppState::new();
+    let mut button = ButtonState::new(ButtonConfig {
+        press_delta: cli.press_delta,
+        release_delta: (u32::from(cli.press_delta) * 2 / 3) as u16,
+        long_press: Duration::from_millis(cli.long_ms),
+        very_long_press: Duration::from_millis(cli.very_long_ms),
+        ..ButtonConfig::default()
+    });
+
     slint::platform::update_timers_and_animations();
-    ui.set_tick(0);
+    refresh_ui(&ui, &state, &button, Instant::now());
     window.draw_if_needed(|renderer| {
         renderer.render(&mut pixels, WIDTH);
     });
@@ -144,8 +215,12 @@ async fn main() -> anyhow::Result<()> {
     let started = Instant::now();
     let deadline = (cli.duration_ms > 0).then(|| started + Duration::from_millis(cli.duration_ms));
     let mut next_frame = Instant::now() + interval;
-    let mut last_keepalive = Instant::now();
     let mut frame_index = 1u64;
+    let mut calibration_announced = false;
+
+    if device.is_some() {
+        println!("calibrating the touch pad; keep hands off the back of the screen");
+    }
 
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -153,10 +228,31 @@ async fn main() -> anyhow::Result<()> {
         }
 
         slint::platform::update_timers_and_animations();
-        ui.set_tick((frame_index % 100) as i32);
-        if frame_index.is_multiple_of(30) {
-            ui.set_label(format!("MSU2 {frame_index:>5}").into());
+
+        // 按键采样就是保活：每次 read_adc 都是一次完整的 USB 往返。
+        if let Some(device) = device.as_mut()
+            && frame_index.is_multiple_of(cli.sample_divisor.max(1))
+        {
+            let now = Instant::now();
+            let raw = device.read_adc(9).await.context(
+                "device stopped responding; unplug/replug the screen-side USB to recover",
+            )?;
+            if let Some(gesture) = button.sample(raw, now) {
+                if cli.verbose {
+                    println!(
+                        "gesture={gesture:?} raw={raw} baseline={}",
+                        button.baseline()
+                    );
+                }
+                state.apply(gesture);
+            }
+            if !calibration_announced && button.is_calibrated() {
+                println!("touch pad calibrated: baseline={}", button.baseline());
+                calibration_announced = true;
+            }
         }
+
+        refresh_ui(&ui, &state, &button, Instant::now());
 
         let mut rendered = false;
         window.draw_if_needed(|renderer| {
@@ -177,7 +273,6 @@ async fn main() -> anyhow::Result<()> {
                     let bytes = send_tiles(device, &current, &rects).await?;
                     stats.bytes += bytes as u64;
                     stats.sent += 1;
-                    last_keepalive = Instant::now();
 
                     if cli.verbose {
                         println!(
@@ -197,15 +292,6 @@ async fn main() -> anyhow::Result<()> {
 
             previous.copy_from_slice(&current);
             stats.rendered += 1;
-        }
-
-        if let Some(device) = device.as_mut()
-            && last_keepalive.elapsed() >= KEEPALIVE_INTERVAL
-        {
-            device.keepalive().await.context(
-                "device stopped responding; unplug/replug the screen-side USB to recover",
-            )?;
-            last_keepalive = Instant::now();
         }
 
         frame_index += 1;
