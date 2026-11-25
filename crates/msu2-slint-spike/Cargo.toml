@@ -9,6 +9,7 @@ name = "msu2-slint-spike"
 path = "src/main.rs"
 
 [dependencies]
+msu2-core.workspace = true
 slint.workspace = true
 
 [build-dependencies]

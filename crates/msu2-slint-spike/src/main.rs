@@ -1,6 +1,7 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use msu2_core::display::{TileGrid, encode_tile_stream};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, WindowAdapter};
 
@@ -43,9 +44,11 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.show()?;
 
     let mut frame = vec![Rgb565Pixel(0); WIDTH * HEIGHT];
-    let mut previous = vec![Rgb565Pixel(0); WIDTH * HEIGHT];
+    let mut previous = vec![0u16; WIDTH * HEIGHT];
+    let grid = TileGrid::new(WIDTH as u16, HEIGHT as u16, TILE as u16).expect("valid tile grid");
     let mut rendered_ticks = 0usize;
     let mut total_dirty_tiles = 0usize;
+    let mut total_wire_bytes = 0usize;
 
     for tick in 0..TICKS {
         ui.set_tick((tick % 100) as i32);
@@ -73,19 +76,45 @@ fn main() -> Result<(), slint::PlatformError> {
             rendered_ticks += 1;
         }
 
-        let (changed_pixels, dirty_tiles) = diff_tiles(&frame, &previous);
+        let current: Vec<u16> = frame.iter().map(|pixel| pixel.0).collect();
+        let changed_pixels = current
+            .iter()
+            .zip(&previous)
+            .filter(|(current, previous)| current != previous)
+            .count();
+        let dirty_tiles = grid.diff(&previous, &current).expect("valid framebuffers");
+
+        let mut wire_bytes = 0usize;
+        let mut preview = None;
+        for tile in &dirty_tiles {
+            let packet = encode_tile_stream(&current, WIDTH as u16, grid.tile_rect(*tile))
+                .expect("valid tile");
+            wire_bytes += packet.len();
+            if preview.is_none() {
+                preview = Some(packet[..packet.len().min(18)].to_vec());
+            }
+        }
+
+        let tile_coords: Vec<_> = dirty_tiles.iter().map(|tile| (tile.x, tile.y)).collect();
         total_dirty_tiles += dirty_tiles.len();
+        total_wire_bytes += wire_bytes;
         println!(
-            "          changed_pixels={changed_pixels} dirty_tiles={} {:?}",
+            "          changed_pixels={changed_pixels} dirty_tiles={} {:?} wire_bytes={wire_bytes} preview={}",
             dirty_tiles.len(),
-            dirty_tiles
+            tile_coords,
+            preview
+                .as_deref()
+                .map(hex_bytes)
+                .unwrap_or_else(|| "<none>".to_owned())
         );
 
-        previous.copy_from_slice(&frame);
+        previous.copy_from_slice(&current);
         std::thread::sleep(Duration::from_millis(150));
     }
 
-    println!("summary: rendered_ticks={rendered_ticks} total_dirty_tiles={total_dirty_tiles}");
+    println!(
+        "summary: rendered_ticks={rendered_ticks} total_dirty_tiles={total_dirty_tiles} total_wire_bytes={total_wire_bytes}"
+    );
 
     let output = std::path::Path::new("target/msu2_dump/slint_frame.bmp");
     std::fs::create_dir_all(output.parent().expect("output parent"))
@@ -132,27 +161,10 @@ fn write_bmp(path: &std::path::Path, frame: &[Rgb565Pixel]) -> std::io::Result<(
     Ok(())
 }
 
-fn diff_tiles(frame: &[Rgb565Pixel], previous: &[Rgb565Pixel]) -> (usize, Vec<(usize, usize)>) {
-    let tiles_x = WIDTH.div_ceil(TILE);
-    let tiles_y = HEIGHT.div_ceil(TILE);
-    let mut changed_pixels = 0usize;
-    let mut tiles = vec![false; tiles_x * tiles_y];
-
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            let index = y * WIDTH + x;
-            if frame[index].0 != previous[index].0 {
-                changed_pixels += 1;
-                tiles[(y / TILE) * tiles_x + x / TILE] = true;
-            }
-        }
-    }
-
-    let dirty = tiles
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
         .iter()
-        .enumerate()
-        .filter_map(|(index, dirty)| dirty.then_some((index % tiles_x, index / tiles_x)))
-        .collect();
-
-    (changed_pixels, dirty)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }

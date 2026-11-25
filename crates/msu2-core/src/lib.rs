@@ -3,7 +3,7 @@
 //! 设备通过 USB CDC 虚拟串口通信，主机发送 6 字节定长命令。
 //! 模块声明统一使用 `crate_macro`。
 
-crate_macro::mod_pub!(device, error, protocol, sfr, transport);
+crate_macro::mod_pub!(device, display, error, protocol, sfr, transport);
 
 pub use device::Msu2Device;
 pub use error::Error;
