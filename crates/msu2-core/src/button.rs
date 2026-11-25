@@ -1,44 +1,38 @@
-//! 单键电容触摸输入：去抖、动态基线与手势识别。
+//! 单键电容触摸输入：去抖、滤波与单击识别。
 //!
 //! 设备背面只有一个接到 ADC9 的覆铜焊盘，固件不推送事件，主机只能轮询
-//! `read_adc(9)`。本模块把原始采样变成可用的手势，并处理两个现实问题：
+//! `read_adc(9)`。本模块把原始采样变成「一次完整的按下-释放」，并处理
+//! 三个现实问题：
 //!
-//! - **基线漂移**：环境电容随温湿度和手的位置变化，固定阈值会失效；
-//! - **抖动**：ADC 噪声会让一次按压在阈值附近反复翻转。
+//! - **基线漂移**：环境电容随温湿度和手的位置变化；
+//! - **抖动**：ADC 噪声会让一次按压在阈值附近反复翻转；
+//! - **回弹**：松手后焊盘的值会在阈值上方振荡，容易连续触发。
 //!
 //! 按下时 ADC 值会**下降**（厂商 Demo 用 `baseline - 125` 判定按下）。
+//!
+//! 这颗焊盘的时间响应不足以可靠区分长按和短按，因此这里只识别单击。
 
 use std::time::{Duration, Instant};
 
-/// 识别出的手势。
+/// 一次完整的按下-释放。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Gesture {
-    /// 短按后释放。
-    Click,
-    /// 按住达到 [`ButtonConfig::long_press`]，在按住期间触发一次。
-    LongPress,
-    /// 按住达到 [`ButtonConfig::very_long_press`]，在按住期间触发一次。
-    VeryLongPress,
+pub struct Press {
+    /// 从首次检测到按下到确认释放的时长，仅供参考。
+    pub held: Duration,
 }
 
-/// 手势识别的参数。
+/// 按键识别的参数。
 #[derive(Debug, Clone, Copy)]
 pub struct ButtonConfig {
     /// 相对基线下降多少判为按下。
     pub press_delta: u16,
     /// 相对基线下降多少仍算按住；必须小于 `press_delta` 才形成迟滞。
     pub release_delta: u16,
-    /// 触发长按的按住时长。
-    pub long_press: Duration,
-    /// 触发超长按的按住时长；应当大于 `long_press`。
-    pub very_long_press: Duration,
     /// 校准所需的采样数。
     pub calibration_samples: u8,
     /// 确认按下所需的连续采样数。
     pub debounce_samples: u8,
     /// 确认释放所需的连续采样数。
-    ///
-    /// 比按下更小可以降低延迟，但太小会让焊盘回弹时的抖动反复触发点击。
     pub release_debounce_samples: u8,
     /// 采样中值滤波窗口；1 表示关闭。
     ///
@@ -61,8 +55,6 @@ impl Default for ButtonConfig {
         Self {
             press_delta: 125,
             release_delta: 80,
-            long_press: Duration::from_millis(600),
-            very_long_press: Duration::from_millis(1500),
             calibration_samples: 8,
             debounce_samples: 2,
             release_debounce_samples: 2,
@@ -88,24 +80,17 @@ impl ButtonConfig {
 enum Phase {
     Calibrating,
     Idle,
-    Pressed {
-        since: Instant,
-        long_fired: bool,
-        very_long_fired: bool,
-    },
+    Pressed { since: Instant },
 }
 
-/// 单键手势状态机。
-///
-/// 每次采样调用 [`ButtonState::sample`]；状态翻转和长按都会在采样点触发，
-/// 因此采样频率决定了手势的时间分辨率。
+/// 单键单击状态机。
 pub struct ButtonState {
     config: ButtonConfig,
     phase: Phase,
     calibration: Vec<u16>,
-    baseline: u32,
     calibration_min: u16,
     calibration_max: u16,
+    baseline: u32,
     history: Vec<u16>,
     last_filtered: u16,
     candidate: Option<bool>,
@@ -120,9 +105,9 @@ impl ButtonState {
             config,
             phase: Phase::Calibrating,
             calibration: Vec::with_capacity(usize::from(config.calibration_samples)),
-            baseline: 0,
             calibration_min: 0,
             calibration_max: 0,
+            baseline: 0,
             history: Vec::with_capacity(usize::from(config.median_window).max(1)),
             last_filtered: 0,
             candidate: None,
@@ -157,19 +142,8 @@ impl ButtonState {
         matches!(self.phase, Phase::Pressed { .. })
     }
 
-    /// 按住进度，0.0 到 1.0，用于界面反馈。
-    pub fn hold_progress(&self, now: Instant) -> f32 {
-        match self.phase {
-            Phase::Pressed { since, .. } => {
-                let held = now.saturating_duration_since(since).as_secs_f32();
-                (held / self.config.long_press.as_secs_f32()).clamp(0.0, 1.0)
-            }
-            _ => 0.0,
-        }
-    }
-
-    /// 输入一次采样，返回本次采样触发的手势。
-    pub fn sample(&mut self, raw: u16, now: Instant) -> Option<Gesture> {
+    /// 输入一次采样，在释放时返回这次按压。
+    pub fn sample(&mut self, raw: u16, now: Instant) -> Option<Press> {
         if matches!(self.phase, Phase::Calibrating) {
             self.calibration.push(raw);
             if self.calibration.len() >= usize::from(self.config.calibration_samples.max(1)) {
@@ -234,42 +208,21 @@ impl ButtonState {
         if self.candidate_samples >= needed {
             match (self.phase, raw_pressed) {
                 (Phase::Idle, true) => {
-                    // 从第一次疑似按下的采样开始计时，避免去抖延迟把
-                    // 一次轻点算成长按。
+                    // 从第一次疑似按下的采样开始计时，便于报告近似按住时长。
                     self.phase = Phase::Pressed {
                         since: self.candidate_since.unwrap_or(now),
-                        long_fired: false,
-                        very_long_fired: false,
                     };
                     self.candidate_samples = 0;
                 }
-                (Phase::Pressed { long_fired, .. }, false) => {
+                (Phase::Pressed { since }, false) => {
                     self.phase = Phase::Idle;
                     self.candidate_samples = 0;
                     self.last_release = Some(now);
-                    if !long_fired {
-                        return Some(Gesture::Click);
-                    }
+                    return Some(Press {
+                        held: now.saturating_duration_since(since),
+                    });
                 }
                 _ => {}
-            }
-        }
-
-        if let Phase::Pressed {
-            since,
-            long_fired,
-            very_long_fired,
-        } = &mut self.phase
-        {
-            let held = now.saturating_duration_since(*since);
-            if !*very_long_fired && held >= self.config.very_long_press {
-                *very_long_fired = true;
-                *long_fired = true;
-                return Some(Gesture::VeryLongPress);
-            }
-            if !*long_fired && held >= self.config.long_press {
-                *long_fired = true;
-                return Some(Gesture::LongPress);
             }
         }
 
@@ -301,8 +254,6 @@ mod tests {
             debounce_samples: 2,
             release_debounce_samples: 2,
             median_window: 1,
-            long_press: Duration::from_millis(300),
-            very_long_press: Duration::from_millis(900),
             ..ButtonConfig::default()
         }
     }
@@ -333,55 +284,21 @@ mod tests {
     }
 
     #[test]
-    fn click_on_short_press() {
+    fn press_reports_release_once() {
         let (mut state, start) = calibrated();
 
         assert_eq!(state.sample(800, start), None);
         assert_eq!(state.sample(800, at(start, 10)), None);
         assert!(state.is_pressed());
 
-        // 释放需要两次采样确认。
         assert_eq!(state.sample(1000, at(start, 100)), None);
-        assert_eq!(state.sample(1000, at(start, 110)), Some(Gesture::Click));
+        let press = state.sample(1000, at(start, 110)).expect("release");
+        assert_eq!(press.held, Duration::from_millis(110));
         assert!(!state.is_pressed());
-    }
 
-    #[test]
-    fn long_press_fires_while_held() {
-        let (mut state, start) = calibrated();
-        state.sample(800, start);
-        state.sample(800, at(start, 10));
-
-        assert_eq!(state.sample(800, at(start, 200)), None);
-        assert_eq!(state.sample(800, at(start, 310)), Some(Gesture::LongPress));
-        assert_eq!(state.sample(800, at(start, 400)), None);
-
-        // 长按后的释放不再产生 Click。
-        assert_eq!(state.sample(1000, at(start, 500)), None);
-    }
-
-    #[test]
-    fn hold_time_starts_at_the_first_press_sample() {
-        let (mut state, start) = calibrated();
-        // 首次疑似按下就应当开始计时，而不是等去抖确认之后。
-        state.sample(800, start);
-        state.sample(800, at(start, 20));
-
-        // 从 start 算起已经 310 ms，达到长按阈值。
-        assert_eq!(state.sample(800, at(start, 310)), Some(Gesture::LongPress));
-    }
-
-    #[test]
-    fn very_long_press_skips_long_press() {
-        let (mut state, start) = calibrated();
-        state.sample(800, start);
-        state.sample(800, at(start, 10));
-
-        assert_eq!(
-            state.sample(800, at(start, 1000)),
-            Some(Gesture::VeryLongPress)
-        );
-        assert_eq!(state.sample(800, at(start, 1100)), None);
+        // 继续停在松开状态不会重复触发。
+        assert_eq!(state.sample(1000, at(start, 400)), None);
+        assert_eq!(state.sample(1000, at(start, 410)), None);
     }
 
     #[test]
@@ -413,13 +330,28 @@ mod tests {
     }
 
     #[test]
+    fn release_lockout_swallows_bounce_back() {
+        let (mut state, start) = calibrated();
+
+        state.sample(800, start);
+        state.sample(800, at(start, 10));
+        state.sample(1000, at(start, 100));
+        assert!(state.sample(1000, at(start, 110)).is_some());
+
+        // 松手后值回弹到阈值以下，但还在 250 ms 锁定期内。
+        for offset in [140, 150, 160, 170] {
+            assert_eq!(state.sample(800, at(start, offset)), None);
+        }
+        assert!(!state.is_pressed());
+    }
+
+    #[test]
     fn median_filter_rejects_a_single_spike() {
         let (mut state, start) = calibrated_with(ButtonConfig {
             median_window: 3,
             ..config()
         });
 
-        // 基线附近的一次尖峰不应触发按下。
         state.sample(1000, at(start, 0));
         state.sample(700, at(start, 10));
         state.sample(1000, at(start, 20));
@@ -439,28 +371,6 @@ mod tests {
         assert_eq!(state.last_filtered(), 700);
         state.sample(700, at(start, 30));
         assert!(state.is_pressed());
-    }
-
-    #[test]
-    fn release_lockout_swallows_bounce_back() {
-        let (mut state, start) = calibrated();
-
-        state.sample(800, start);
-        state.sample(800, at(start, 10));
-        state.sample(1000, at(start, 100));
-        assert_eq!(state.sample(1000, at(start, 110)), Some(Gesture::Click));
-
-        // 松手后值回弹到阈值以下，但还在 250 ms 锁定期内。
-        for offset in [140, 150, 160, 170] {
-            assert_eq!(state.sample(800, at(start, offset)), None);
-        }
-        assert!(!state.is_pressed());
-    }
-
-    #[test]
-    fn reports_calibration_spread() {
-        let (state, _) = calibrated();
-        assert_eq!(state.calibration_spread(), 1100 - 980);
     }
 
     #[test]
@@ -492,13 +402,8 @@ mod tests {
     }
 
     #[test]
-    fn hold_progress_reaches_one_at_long_press() {
-        let (mut state, start) = calibrated();
-        state.sample(800, start);
-        state.sample(800, at(start, 10));
-
-        assert!(state.hold_progress(at(start, 10)) < 0.1);
-        assert!((state.hold_progress(at(start, 160)) - 0.5).abs() < 0.05);
-        assert_eq!(state.hold_progress(at(start, 400)), 1.0);
+    fn reports_calibration_spread() {
+        let (state, _) = calibrated();
+        assert_eq!(state.calibration_spread(), 1100 - 980);
     }
 }

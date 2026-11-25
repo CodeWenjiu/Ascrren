@@ -3,113 +3,49 @@ export component AppWindow inherits Window {
     height: 80px;
     background: #081018;
 
-    // 页面：0 = 列表，1 = 详情
     in property <int> page: 0;
-    in property <int> selected: 0;
     in property <bool> pressed: false;
-    in property <float> hold-progress: 0.0;
-    in property <string> detail-title: "Clock";
-    in property <[string]> items: ["Clock", "System", "Settings"];
+    in property <[string]> titles: ["HELLO", "INPUT", "RENDER", "USB"];
+    in property <[string]> subtitles: [
+        "MSU2 160x80 RGB565",
+        "TAP TO CYCLE PAGES",
+        "SLINT SOFTWARE RENDER",
+        "CDC ACM TILE DIFF"
+    ];
+    in property <[int]> dots: [0, 1, 2, 3];
 
-    if root.page == 0 : Rectangle {
+    Text {
+        x: 0px;
+        y: 12px;
         width: 160px;
-        height: 80px;
-        background: transparent;
-
-        VerticalLayout {
-            x: 6px;
-            y: 4px;
-            width: 148px;
-            spacing: 2px;
-
-            for item[index] in root.items : Rectangle {
-                height: 18px;
-                border-radius: 3px;
-                background: index == root.selected ? #17475c : #0d1a24;
-
-                Rectangle {
-                    x: 0px;
-                    width: index == root.selected ? 3px : 0px;
-                    height: parent.height;
-                    border-radius: 2px;
-                    background: #37c8ff;
-                }
-
-                Text {
-                    x: 10px;
-                    width: 130px;
-                    height: parent.height;
-                    vertical-alignment: center;
-                    text: item;
-                    color: index == root.selected ? #a8eeff : #55707f;
-                    font-size: 12px;
-                }
-            }
-        }
-
-        Rectangle {
-            x: 6px;
-            y: 66px;
-            width: 148px;
-            height: 3px;
-            border-radius: 2px;
-            background: #12242e;
-        }
-
-        Rectangle {
-            x: 6px;
-            y: 66px;
-            width: 148px * root.hold-progress;
-            height: 3px;
-            border-radius: 2px;
-            background: #37c8ff;
-            visible: root.hold-progress > 0;
-        }
-
-        Text {
-            x: 6px;
-            y: 71px;
-            width: 148px;
-            horizontal-alignment: center;
-            text: root.pressed ? "HOLD TO OPEN" : "TAP NEXT / HOLD OPEN";
-            color: #3d5a6b;
-            font-size: 8px;
-        }
+        horizontal-alignment: center;
+        text: root.titles[root.page];
+        color: root.pressed ? #ffffff : #7fe7ff;
+        font-size: 24px;
     }
 
-    if root.page == 1 : Rectangle {
+    Text {
+        x: 0px;
+        y: 48px;
         width: 160px;
-        height: 80px;
-        background: transparent;
+        horizontal-alignment: center;
+        text: root.subtitles[root.page];
+        color: #55707f;
+        font-size: 9px;
+    }
 
-        Text {
-            x: 0px;
-            y: 14px;
-            width: 160px;
-            horizontal-alignment: center;
-            text: root.detail-title;
-            color: #a8eeff;
-            font-size: 22px;
-        }
+    HorizontalLayout {
+        x: 0px;
+        y: 68px;
+        width: 160px;
+        alignment: center;
+        spacing: 6px;
 
-        Text {
-            x: 0px;
-            y: 48px;
-            width: 160px;
-            horizontal-alignment: center;
-            text: "DETAIL VIEW";
-            color: #2f4a59;
-            font-size: 9px;
-        }
-
-        Text {
-            x: 0px;
-            y: 62px;
-            width: 160px;
-            horizontal-alignment: center;
-            text: "TAP TO BACK  /  HOLD TO HOME";
-            color: #3d5a6b;
-            font-size: 8px;
+        for dot[index] in root.dots : Rectangle {
+            width: 5px;
+            height: 5px;
+            border-radius: 3px;
+            background: index == root.page ? #37c8ff : #1b2c36;
         }
     }
 }

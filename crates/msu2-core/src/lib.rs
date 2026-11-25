@@ -5,7 +5,7 @@
 
 crate_macro::mod_pub!(button, device, display, error, protocol, sfr, transport);
 
-pub use button::{ButtonConfig, ButtonState, Gesture};
+pub use button::{ButtonConfig, ButtonState, Press};
 pub use device::{Msu2Device, STREAM_TIMEOUT};
 pub use error::Error;
 pub use protocol::Frame;

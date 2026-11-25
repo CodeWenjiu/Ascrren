@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use msu2_core::display::{DISPLAY_HEIGHT, DISPLAY_WIDTH, Rect, TileGrid, rgb565_bytes};
-use msu2_core::{ButtonConfig, ButtonState, Gesture, Msu2Device, STREAM_TIMEOUT};
+use msu2_core::{ButtonConfig, ButtonState, Msu2Device, STREAM_TIMEOUT};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, WindowAdapter};
 
@@ -26,8 +26,8 @@ const WIDTH: usize = DISPLAY_WIDTH as usize;
 const HEIGHT: usize = DISPLAY_HEIGHT as usize;
 const TILE_SIZE: u16 = 16;
 
-/// 列表页的可选项。
-const ITEMS: [&str; 3] = ["Clock", "System", "Settings"];
+/// 循环展示的页面数。
+const PAGES: usize = 4;
 
 #[derive(Debug, Parser)]
 #[command(name = "msu2-slint", about = "把 Slint 界面实时镜像到 MSU2 副屏")]
@@ -80,14 +80,6 @@ struct Cli {
     #[arg(long, default_value_t = 250)]
     release_lockout_ms: u64,
 
-    /// 长按阈值（毫秒）
-    #[arg(long, default_value_t = 600)]
-    long_ms: u64,
-
-    /// 超长按阈值（毫秒）
-    #[arg(long, default_value_t = 1500)]
-    very_long_ms: u64,
-
     /// 跟踪基线漂移（默认关闭；ADC 噪声会让基线随机游走）
     #[arg(long)]
     track_baseline: bool,
@@ -129,49 +121,23 @@ struct Stats {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Page {
-    List,
-    Detail,
-}
-
 struct AppState {
-    page: Page,
-    focus: usize,
+    page: usize,
 }
 
 impl AppState {
     fn new() -> Self {
-        Self {
-            page: Page::List,
-            focus: 0,
-        }
+        Self { page: 0 }
     }
 
-    fn apply(&mut self, gesture: Gesture) {
-        match gesture {
-            Gesture::Click => match self.page {
-                Page::List => self.focus = (self.focus + 1) % ITEMS.len(),
-                Page::Detail => self.page = Page::List,
-            },
-            Gesture::LongPress => {
-                if self.page == Page::List {
-                    self.page = Page::Detail;
-                }
-            }
-            Gesture::VeryLongPress => self.page = Page::List,
-        }
+    fn advance(&mut self) {
+        self.page = (self.page + 1) % PAGES;
     }
 }
 
-fn refresh_ui(ui: &AppWindow, state: &AppState, button: &ButtonState, now: Instant) {
-    ui.set_page(match state.page {
-        Page::List => 0,
-        Page::Detail => 1,
-    });
-    ui.set_selected(state.focus as i32);
-    ui.set_detail_title(ITEMS[state.focus].into());
+fn refresh_ui(ui: &AppWindow, state: &AppState, button: &ButtonState) {
+    ui.set_page(state.page as i32);
     ui.set_pressed(button.is_pressed());
-    ui.set_hold_progress(button.hold_progress(now));
 }
 
 #[tokio::main]
@@ -208,14 +174,12 @@ async fn main() -> anyhow::Result<()> {
         release_delta: (u32::from(cli.press_delta) * 2 / 3) as u16,
         median_window: cli.median_window,
         release_lockout: Duration::from_millis(cli.release_lockout_ms),
-        long_press: Duration::from_millis(cli.long_ms),
-        very_long_press: Duration::from_millis(cli.very_long_ms),
         track_baseline: cli.track_baseline,
         ..ButtonConfig::default()
     });
 
     slint::platform::update_timers_and_animations();
-    refresh_ui(&ui, &state, &button, Instant::now());
+    refresh_ui(&ui, &state, &button);
     window.draw_if_needed(|renderer| {
         renderer.render(&mut pixels, WIDTH);
     });
@@ -264,25 +228,24 @@ async fn main() -> anyhow::Result<()> {
             stats.sample_total += sample_cost;
             stats.sample_max = stats.sample_max.max(sample_cost);
 
-            let gesture = button.sample(raw, now);
+            let press = button.sample(raw, now);
 
             if cli.trace {
                 println!(
-                    "raw={raw:>5} filtered={:>5} baseline={:>5} pressed={:<5} progress={:.2}",
+                    "raw={raw:>5} filtered={:>5} baseline={:>5} pressed={:<5}",
                     button.last_filtered(),
-                    button.baseline(),
-                    button.is_pressed(),
-                    button.hold_progress(now)
-                );
-            }
-
-            if let Some(gesture) = gesture {
-                println!(
-                    "gesture={gesture:?} raw={raw} baseline={} pressed={}",
                     button.baseline(),
                     button.is_pressed()
                 );
-                state.apply(gesture);
+            }
+
+            if let Some(press) = press {
+                state.advance();
+                println!(
+                    "press held={}ms page={}",
+                    press.held.as_millis(),
+                    state.page
+                );
             }
             if !calibration_announced && button.is_calibrated() {
                 println!(
@@ -299,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        refresh_ui(&ui, &state, &button, Instant::now());
+        refresh_ui(&ui, &state, &button);
 
         let mut rendered = false;
         window.draw_if_needed(|renderer| {
