@@ -1,0 +1,15 @@
+[package]
+name = "msu2-slint-spike"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.95"
+
+[[bin]]
+name = "msu2-slint-spike"
+path = "src/main.rs"
+
+[dependencies]
+slint.workspace = true
+
+[build-dependencies]
+slint-build = "1.19"

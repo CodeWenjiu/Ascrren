@@ -38,6 +38,8 @@
             wasm-bindgen-cli
             sccache
             pkg-config
+            fontconfig
+            freetype
             udev
             uhubctl
           ];
