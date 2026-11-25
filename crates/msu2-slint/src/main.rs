@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use clap::Parser;
-use msu2_core::Msu2Device;
-use msu2_core::display::{DISPLAY_HEIGHT, DISPLAY_WIDTH, Rect, TileGrid};
+use msu2_core::display::{DISPLAY_HEIGHT, DISPLAY_WIDTH, Rect, TileGrid, rgb565_bytes};
+use msu2_core::{Msu2Device, STREAM_TIMEOUT};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, WindowAdapter};
 
@@ -25,9 +25,6 @@ slint::include_modules!();
 const WIDTH: usize = DISPLAY_WIDTH as usize;
 const HEIGHT: usize = DISPLAY_HEIGHT as usize;
 const TILE_SIZE: u16 = 16;
-
-/// 单次写入的最长等待时间；固件卡死时 USB 写会因流控永久阻塞。
-const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 没有画面更新时，多久发一次读命令保活。
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
@@ -205,7 +202,7 @@ async fn main() -> anyhow::Result<()> {
         if let Some(device) = device.as_mut()
             && last_keepalive.elapsed() >= KEEPALIVE_INTERVAL
         {
-            device.read_adc(9).await.context(
+            device.keepalive().await.context(
                 "device stopped responding; unplug/replug the screen-side USB to recover",
             )?;
             last_keepalive = Instant::now();
@@ -248,32 +245,20 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn connect(cli: &Cli) -> anyhow::Result<Msu2Device> {
-    let path = match &cli.port {
-        Some(port) => port.clone(),
-        None => {
-            msu2_core::find_msu2_port()
-                .context("no MSU2 device found; pass --port")?
-                .path
-        }
+    let timeout = Duration::from_millis(cli.timeout_ms);
+    let mut device = match &cli.port {
+        Some(port) => Msu2Device::connect(port.clone(), cli.baud, timeout)
+            .await
+            .with_context(|| format!("failed to connect to MSU2 on {port}"))?,
+        None => Msu2Device::auto_connect(cli.baud, timeout)
+            .await
+            .context("no MSU2 device found; pass --port")?,
     };
-
-    let mut device = Msu2Device::connect(
-        path.clone(),
-        cli.baud,
-        Duration::from_millis(cli.timeout_ms),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "failed to connect to MSU2 on {path}; check the cable, permissions, \
-                 and whether another program owns the port"
-        )
-    })?;
     device
         .initialize()
         .await
         .context("failed to initialize MSU2")?;
-    println!("connected to {path}");
+    println!("connected to {}", device.path());
     Ok(device)
 }
 
@@ -287,7 +272,7 @@ async fn send_full_frame(device: &mut Msu2Device, frame: &[u16]) -> anyhow::Resu
     let bytes = rgb565_bytes(frame);
     let len = bytes.len();
     tokio::time::timeout(
-        SEND_TIMEOUT,
+        STREAM_TIMEOUT,
         device.display_frame(0, 0, WIDTH as u16, HEIGHT as u16, &bytes),
     )
     .await
@@ -302,26 +287,18 @@ async fn send_tiles(
     rects: &[Rect],
 ) -> anyhow::Result<usize> {
     let bytes = tokio::time::timeout(
-        SEND_TIMEOUT,
+        STREAM_TIMEOUT,
         device.stream_tiles(frame, WIDTH as u16, rects),
     )
     .await
     .map_err(|_| {
         anyhow!(
-            "tile write timed out after {SEND_TIMEOUT:?}; firmware likely hung, \
+            "tile write timed out after {STREAM_TIMEOUT:?}; firmware likely hung, \
              unplug/replug the screen-side USB"
         )
     })?
     .context("failed to stream tiles")?;
     Ok(bytes)
-}
-
-fn rgb565_bytes(frame: &[u16]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(frame.len() * 2);
-    for pixel in frame {
-        bytes.extend_from_slice(&pixel.to_be_bytes());
-    }
-    bytes
 }
 
 fn write_bmp(path: &std::path::Path, frame: &[Rgb565Pixel]) -> std::io::Result<()> {

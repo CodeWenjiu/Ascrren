@@ -248,6 +248,15 @@ pub fn encode_tile_stream(frame: &[u16], frame_width: u16, tile: Rect) -> Result
     Ok(packet)
 }
 
+/// 把 RGB565 framebuffer 转成协议使用的大端字节流。
+pub fn rgb565_bytes(frame: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(frame.len() * 2);
+    for pixel in frame {
+        bytes.extend_from_slice(&pixel.to_be_bytes());
+    }
+    bytes
+}
+
 /// 把多个矩形编码成一个连续 packet，每个矩形仍保留自己的窗口设置和
 /// `stream_start`。多个矩形合并成一次 USB 写入可显著减少传输次数。
 pub fn encode_tiles(frame: &[u16], frame_width: u16, tiles: &[Rect]) -> Result<Vec<u8>, Error> {

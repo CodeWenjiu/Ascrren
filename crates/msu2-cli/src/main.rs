@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use msu2_core::display::TileGrid;
-use msu2_core::{Frame, Msu2Device, SfrValue};
+use msu2_core::display::{TileGrid, rgb565_bytes};
+use msu2_core::{Frame, Msu2Device, STREAM_TIMEOUT, SfrValue};
 
 #[derive(Debug, Parser)]
 #[command(name = "msu2", version, about = "MSU2 USB 副屏跨平台命令行工具")]
@@ -723,9 +723,6 @@ struct AnimateSpec {
     sync: bool,
 }
 
-/// 单次增量写入的最长等待时间。固件卡死时写操作会因 USB 流控永久阻塞。
-const SEND_TIMEOUT: Duration = Duration::from_secs(3);
-
 /// 在一个长驻的 framebuffer 上移动方块，只发送变化的 tile。
 ///
 /// 这是 GUI 增量刷新的最小模拟：每帧重建目标画面，与上一帧做 tile
@@ -808,14 +805,14 @@ async fn cmd_animate(
                 let rects = grid.merge_tiles(&dirty);
                 rects_total += rects.len() as u64;
                 match tokio::time::timeout(
-                    SEND_TIMEOUT,
+                    STREAM_TIMEOUT,
                     device.stream_tiles(&frame, WIDTH as u16, &rects),
                 )
                 .await
                 {
                     Ok(result) => result.map(|bytes| (bytes, rects.len())),
                     Err(_) => bail!(
-                        "tile write timed out after {SEND_TIMEOUT:?}; \
+                        "tile write timed out after {STREAM_TIMEOUT:?}; \
                          firmware likely hung, unplug/replug the screen-side USB"
                     ),
                 }
@@ -825,7 +822,7 @@ async fn cmd_animate(
                 let mut result = Ok(());
                 for tile in &dirty {
                     match tokio::time::timeout(
-                        SEND_TIMEOUT,
+                        STREAM_TIMEOUT,
                         device.stream_tiles(&frame, WIDTH as u16, &[grid.tile_rect(*tile)]),
                     )
                     .await
@@ -836,7 +833,7 @@ async fn cmd_animate(
                             break;
                         }
                         Err(_) => bail!(
-                            "tile write timed out after {SEND_TIMEOUT:?}; \
+                            "tile write timed out after {STREAM_TIMEOUT:?}; \
                              firmware likely hung, unplug/replug the screen-side USB"
                         ),
                     }
@@ -896,14 +893,6 @@ async fn cmd_animate(
     Ok(())
 }
 
-fn rgb565_bytes(frame: &[u16]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(frame.len() * 2);
-    for pixel in frame {
-        bytes.extend_from_slice(&pixel.to_be_bytes());
-    }
-    bytes
-}
-
 async fn hold_session(device: &mut Msu2Device, hold_ms: u64) -> anyhow::Result<()> {
     if hold_ms == 0 {
         return Ok(());
@@ -913,8 +902,8 @@ async fn hold_session(device: &mut Msu2Device, hold_ms: u64) -> anyhow::Result<(
     let mut failures = 0u32;
     while Instant::now() < deadline {
         // 只保活，不重复发送流式数据，避免放大固件风险。
-        match device.read_adc(9).await {
-            Ok(_) => failures = 0,
+        match device.keepalive().await {
+            Ok(()) => failures = 0,
             Err(error) => {
                 failures += 1;
                 if failures >= 2 {
@@ -1075,7 +1064,7 @@ async fn cmd_text(
 
         while Instant::now() < deadline {
             // 与厂商 Demo 类似：周期读 ADC，保持主机会话。
-            let _ = device.read_adc(9).await;
+            let _ = device.keepalive().await;
 
             if refresh_ms > 0 && Instant::now() >= next_refresh {
                 draw_text(device, text, style).await?;

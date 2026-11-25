@@ -5,7 +5,7 @@
 
 crate_macro::mod_pub!(device, display, error, protocol, sfr, transport);
 
-pub use device::Msu2Device;
+pub use device::{Msu2Device, STREAM_TIMEOUT};
 pub use error::Error;
 pub use protocol::Frame;
 pub use sfr::{SfrEntry, SfrKind, SfrTable, SfrValue};

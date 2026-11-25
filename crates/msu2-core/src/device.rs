@@ -46,6 +46,12 @@ impl Msu2Device<SerialTransport> {
     }
 }
 
+/// 单次 LCD 流式写入的建议超时。
+///
+/// 固件卡死时 USB 写会因流控永久阻塞，调用方应当用它包住
+/// [`Msu2Device::stream_tiles`] / [`Msu2Device::display_frame`]。
+pub const STREAM_TIMEOUT: Duration = Duration::from_secs(3);
+
 impl<T: Transport> Msu2Device<T> {
     pub fn from_transport(
         transport: T,
@@ -112,6 +118,13 @@ impl<T: Transport> Msu2Device<T> {
     pub async fn read_adc(&mut self, channel: u8) -> Result<u16, Error> {
         let response = self.request(protocol::adc_read(channel)).await?;
         Ok(u16::from_be_bytes([response[4], response[5]]))
+    }
+
+    /// 读一次按键 ADC 并丢弃结果，用于空闲时保持连接。
+    ///
+    /// 固件在主机长时间不通信后会回到出场动画，长驻程序应当周期性调用。
+    pub async fn keepalive(&mut self) -> Result<(), Error> {
+        self.read_adc(9).await.map(|_| ())
     }
 
     /// 读外部 Flash 的一个字节。
