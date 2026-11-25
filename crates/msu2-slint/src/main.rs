@@ -72,6 +72,10 @@ struct Cli {
     #[arg(long, default_value_t = 125)]
     press_delta: u16,
 
+    /// 中值滤波窗口；1 表示关闭
+    #[arg(long, default_value_t = 3)]
+    median_window: u8,
+
     /// 长按阈值（毫秒）
     #[arg(long, default_value_t = 600)]
     long_ms: u64,
@@ -198,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
     let mut button = ButtonState::new(ButtonConfig {
         press_delta: cli.press_delta,
         release_delta: (u32::from(cli.press_delta) * 2 / 3) as u16,
+        median_window: cli.median_window,
         long_press: Duration::from_millis(cli.long_ms),
         very_long_press: Duration::from_millis(cli.very_long_ms),
         track_baseline: cli.track_baseline,
@@ -254,16 +259,19 @@ async fn main() -> anyhow::Result<()> {
             stats.sample_total += sample_cost;
             stats.sample_max = stats.sample_max.max(sample_cost);
 
+            let gesture = button.sample(raw, now);
+
             if cli.trace {
                 println!(
-                    "raw={raw:>5} baseline={:>5} pressed={:<5} progress={:.2}",
+                    "raw={raw:>5} filtered={:>5} baseline={:>5} pressed={:<5} progress={:.2}",
+                    button.last_filtered(),
                     button.baseline(),
                     button.is_pressed(),
                     button.hold_progress(now)
                 );
             }
 
-            if let Some(gesture) = button.sample(raw, now) {
+            if let Some(gesture) = gesture {
                 println!(
                     "gesture={gesture:?} raw={raw} baseline={} pressed={}",
                     button.baseline(),
@@ -272,7 +280,16 @@ async fn main() -> anyhow::Result<()> {
                 state.apply(gesture);
             }
             if !calibration_announced && button.is_calibrated() {
-                println!("touch pad calibrated: baseline={}", button.baseline());
+                println!(
+                    "touch pad calibrated: baseline={} spread={}",
+                    button.baseline(),
+                    button.calibration_spread()
+                );
+                if button.calibration_spread() > 60 {
+                    println!(
+                        "warning: samples were noisy during calibration; restart and keep hands off the back"
+                    );
+                }
                 calibration_announced = true;
             }
         }

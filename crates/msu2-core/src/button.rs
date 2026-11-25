@@ -38,8 +38,12 @@ pub struct ButtonConfig {
     pub debounce_samples: u8,
     /// 确认释放所需的连续采样数。
     ///
-    /// 比按下更小是故意的：释放判定晚一个采样就可能把点击误算成长按。
+    /// 比按下更小可以降低延迟，但太小会让焊盘回弹时的抖动反复触发点击。
     pub release_debounce_samples: u8,
+    /// 采样中值滤波窗口；1 表示关闭。
+    ///
+    /// 窗口越大越能抑制单点噪声，但会多延迟约半个窗口的采样。
+    pub median_window: u8,
     /// 是否在空闲时跟踪基线漂移。
     ///
     /// 默认关闭——ADC 噪声会让 EMA 随机游走，反而使阈值漂移。
@@ -57,7 +61,8 @@ impl Default for ButtonConfig {
             very_long_press: Duration::from_millis(1500),
             calibration_samples: 8,
             debounce_samples: 2,
-            release_debounce_samples: 1,
+            release_debounce_samples: 2,
+            median_window: 3,
             track_baseline: false,
             baseline_ema_shift: 6,
         }
@@ -94,6 +99,10 @@ pub struct ButtonState {
     phase: Phase,
     calibration: Vec<u16>,
     baseline: u32,
+    calibration_min: u16,
+    calibration_max: u16,
+    history: Vec<u16>,
+    last_filtered: u16,
     candidate: Option<bool>,
     candidate_samples: u8,
     candidate_since: Option<Instant>,
@@ -106,6 +115,10 @@ impl ButtonState {
             phase: Phase::Calibrating,
             calibration: Vec::with_capacity(usize::from(config.calibration_samples)),
             baseline: 0,
+            calibration_min: 0,
+            calibration_max: 0,
+            history: Vec::with_capacity(usize::from(config.median_window).max(1)),
+            last_filtered: 0,
             candidate: None,
             candidate_samples: 0,
             candidate_since: None,
@@ -120,6 +133,16 @@ impl ButtonState {
     /// 校准得到的基线值。
     pub fn baseline(&self) -> u32 {
         self.baseline
+    }
+
+    /// 校准样本的极差；很大说明校准时手在动，结果不可信。
+    pub fn calibration_spread(&self) -> u16 {
+        self.calibration_max.saturating_sub(self.calibration_min)
+    }
+
+    /// 最近一次采样经过中值滤波后的值。
+    pub fn last_filtered(&self) -> u16 {
+        self.last_filtered
     }
 
     /// 当前是否处于按下状态。
@@ -144,11 +167,16 @@ impl ButtonState {
             self.calibration.push(raw);
             if self.calibration.len() >= usize::from(self.config.calibration_samples.max(1)) {
                 self.calibration.sort_unstable();
+                self.calibration_min = self.calibration[0];
+                self.calibration_max = self.calibration[self.calibration.len() - 1];
                 self.baseline = u32::from(self.calibration[self.calibration.len() / 2]);
                 self.phase = Phase::Idle;
             }
             return None;
         }
+
+        let raw = self.filter(raw);
+        self.last_filtered = raw;
 
         // 空闲且开启跟踪时缓慢修正温漂；按下期间冻结基线，避免把按压
         // 本身当成漂移吸收掉。默认关闭，因为 ADC 噪声会让 EMA 随机游走。
@@ -232,6 +260,20 @@ impl ButtonState {
 
         None
     }
+
+    fn filter(&mut self, raw: u16) -> u16 {
+        let window = usize::from(self.config.median_window.clamp(1, 9));
+        if window <= 1 {
+            return raw;
+        }
+        self.history.push(raw);
+        while self.history.len() > window {
+            self.history.remove(0);
+        }
+        let mut sorted = self.history.clone();
+        sorted.sort_unstable();
+        sorted[sorted.len() / 2]
+    }
 }
 
 #[cfg(test)]
@@ -242,7 +284,8 @@ mod tests {
         ButtonConfig {
             calibration_samples: 4,
             debounce_samples: 2,
-            release_debounce_samples: 1,
+            release_debounce_samples: 2,
+            median_window: 1,
             long_press: Duration::from_millis(300),
             very_long_press: Duration::from_millis(900),
             ..ButtonConfig::default()
@@ -282,8 +325,9 @@ mod tests {
         assert_eq!(state.sample(800, at(start, 10)), None);
         assert!(state.is_pressed());
 
-        // 释放只需一次采样。
-        assert_eq!(state.sample(1000, at(start, 100)), Some(Gesture::Click));
+        // 释放需要两次采样确认。
+        assert_eq!(state.sample(1000, at(start, 100)), None);
+        assert_eq!(state.sample(1000, at(start, 110)), Some(Gesture::Click));
         assert!(!state.is_pressed());
     }
 
@@ -349,7 +393,43 @@ mod tests {
         assert!(state.is_pressed());
 
         state.sample(960, at(start, 200));
+        state.sample(960, at(start, 210));
         assert!(!state.is_pressed());
+    }
+
+    #[test]
+    fn median_filter_rejects_a_single_spike() {
+        let (mut state, start) = calibrated_with(ButtonConfig {
+            median_window: 3,
+            ..config()
+        });
+
+        // 基线附近的一次尖峰不应触发按下。
+        state.sample(1000, at(start, 0));
+        state.sample(700, at(start, 10));
+        state.sample(1000, at(start, 20));
+        assert!(!state.is_pressed());
+    }
+
+    #[test]
+    fn median_filter_passes_a_sustained_press() {
+        let (mut state, start) = calibrated_with(ButtonConfig {
+            median_window: 3,
+            ..config()
+        });
+
+        state.sample(1000, at(start, 0));
+        state.sample(700, at(start, 10));
+        state.sample(700, at(start, 20));
+        assert_eq!(state.last_filtered(), 700);
+        state.sample(700, at(start, 30));
+        assert!(state.is_pressed());
+    }
+
+    #[test]
+    fn reports_calibration_spread() {
+        let (state, _) = calibrated();
+        assert_eq!(state.calibration_spread(), 1100 - 980);
     }
 
     #[test]
