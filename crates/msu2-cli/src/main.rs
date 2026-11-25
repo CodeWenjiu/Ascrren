@@ -71,6 +71,10 @@ enum Command {
         /// 明知会卡死固件仍要尝试（仅用于调试）
         #[arg(long)]
         force: bool,
+
+        /// 发送后保持连接的时长（毫秒）；用于观察画面是否稳定
+        #[arg(long, default_value_t = 0)]
+        hold_ms: u64,
     },
 
     /// 显示外部 Flash 中预存的彩色图片
@@ -275,9 +279,17 @@ async fn run() -> anyhow::Result<()> {
             height,
             ref color,
             force,
+            hold_ms,
         } => {
             let mut device = connect(&cli).await?;
-            cmd_fill(&mut device, x, y, width, height, color, force).await
+            let spec = FillSpec {
+                x,
+                y,
+                width,
+                height,
+                color: color.clone(),
+            };
+            cmd_fill(&mut device, &spec, force, hold_ms).await
         }
         Command::Photo {
             page,
@@ -493,14 +505,19 @@ async fn cmd_key(device: &mut Msu2Device, count: u32, interval_ms: u64) -> anyho
     Ok(())
 }
 
-async fn cmd_fill(
-    device: &mut Msu2Device,
+struct FillSpec {
     x: u16,
     y: u16,
     width: u16,
     height: u16,
-    color: &str,
+    color: String,
+}
+
+async fn cmd_fill(
+    device: &mut Msu2Device,
+    spec: &FillSpec,
     force: bool,
+    hold_ms: u64,
 ) -> anyhow::Result<()> {
     if !force {
         bail!(
@@ -508,37 +525,59 @@ async fn cmd_fill(
              use `photo`, `ascii`, or `gb2312` instead, or pass --force for debugging"
         );
     }
-    if width == 0 || height == 0 {
+    if spec.width == 0 || spec.height == 0 {
         bail!("width and height must be greater than zero");
     }
-    if width < 16 || height < 16 {
+    if spec.width < 16 || spec.height < 16 {
         bail!(
             "width and height must be at least 16; tiny windows hit a firmware LCD/DMA edge case"
         );
     }
-    if x.saturating_add(width) > 160 || y.saturating_add(height) > 80 {
+    if spec.x.saturating_add(spec.width) > 160 || spec.y.saturating_add(spec.height) > 80 {
         bail!("rectangle must fit inside the 160x80 screen");
     }
 
-    let rgb565 = parse_rgb565(color)?;
+    let rgb565 = parse_rgb565(&spec.color)?;
     device
         .initialize()
         .await
         .context("failed to initialize MSU2")?;
     device
-        .fill_rect(x, y, width, height, rgb565)
+        .fill_rect(spec.x, spec.y, spec.width, spec.height, rgb565)
         .await
         .context("failed to stream fill data")?;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     println!(
         "filled {}x{} at ({}, {}) with #{} (RGB565 0x{rgb565:04X})",
-        width,
-        height,
-        x,
-        y,
-        color.trim_start_matches('#').to_uppercase()
+        spec.width,
+        spec.height,
+        spec.x,
+        spec.y,
+        spec.color.trim_start_matches('#').to_uppercase()
     );
+
+    if hold_ms > 0 {
+        let deadline = Instant::now() + Duration::from_millis(hold_ms);
+        let mut failures = 0u32;
+        while Instant::now() < deadline {
+            // 只保活，不重复发送流式数据，避免放大固件风险。
+            match device.read_adc(9).await {
+                Ok(_) => failures = 0,
+                Err(error) => {
+                    failures += 1;
+                    if failures >= 2 {
+                        bail!(
+                            "device stopped responding after streaming ({error}); \
+                             firmware likely hung, unplug/replug USB to recover"
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        println!("held session for {hold_ms} ms");
+    }
 
     Ok(())
 }
