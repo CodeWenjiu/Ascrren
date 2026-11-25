@@ -1,0 +1,11 @@
+[package]
+name = "msu2-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crate-macro.workspace = true
+tokio.workspace = true
+tokio-serial.workspace = true
+thiserror.workspace = true

@@ -37,6 +37,9 @@
             binaryen
             wasm-bindgen-cli
             sccache
+            pkg-config
+            udev
+            uhubctl
           ];
 
           # 显式声明，避免从父进程（例如在别的项目 direnv 会话里启动的编辑器）

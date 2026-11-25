@@ -1,0 +1,18 @@
+[package]
+name = "msu2-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "msu2"
+path = "src/main.rs"
+
+[dependencies]
+msu2-core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-serial.workspace = true
+
+libc.workspace = true
