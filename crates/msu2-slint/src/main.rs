@@ -9,28 +9,32 @@
 //! msu2-slint --fps 30         # 限制帧率
 //! ```
 
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use clap::Parser;
-use msu2_core::display::{DISPLAY_HEIGHT, DISPLAY_WIDTH, Rect, TileGrid, rgb565_bytes};
-use msu2_core::{ButtonConfig, ButtonState, Msu2Device, STREAM_TIMEOUT};
+use msu2_core::display::{DISPLAY_HEIGHT, DISPLAY_WIDTH, TileGrid};
+use msu2_core::{ButtonConfig, ButtonState};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
-use slint::platform::{Platform, WindowAdapter};
+
+mod app;
+mod usb;
+
+use app::{AppState, Stats, refresh_ui};
+use usb::{connect, copy_pixels, send_full_frame, send_tiles};
 
 slint::include_modules!();
 
-const WIDTH: usize = DISPLAY_WIDTH as usize;
-const HEIGHT: usize = DISPLAY_HEIGHT as usize;
-const TILE_SIZE: u16 = 16;
+pub(crate) const WIDTH: usize = DISPLAY_WIDTH as usize;
+pub(crate) const HEIGHT: usize = DISPLAY_HEIGHT as usize;
+pub(crate) const TILE_SIZE: u16 = 16;
 
 /// 循环展示的页面数。
-const PAGES: usize = 4;
+pub(crate) const PAGES: usize = 4;
 /// USB CDC 下波特率只是名义值。
-const BAUDRATE: u32 = 19200;
+pub(crate) const BAUDRATE: u32 = 19200;
 /// 握手和命令的默认超时。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// 空闲时的采样频率，单位 Hz。
 const IDLE_SAMPLE_HZ: u64 = 15;
 /// 按住或等待恢复时的采样频率，单位 Hz。
@@ -38,70 +42,22 @@ const ACTIVE_SAMPLE_HZ: u64 = 30;
 
 #[derive(Debug, Parser)]
 #[command(name = "msu2-slint", about = "把 Slint 界面实时镜像到 MSU2 副屏")]
-struct Cli {
+pub(crate) struct Cli {
     /// 串口路径；省略时自动查找 VID:PID 1a86:fe0c
     #[arg(long)]
-    port: Option<String>,
+    pub(crate) port: Option<String>,
 
     /// 目标帧率
     #[arg(long, default_value_t = 60)]
-    fps: u64,
+    pub(crate) fps: u64,
 
     /// 运行时长（毫秒）；0 表示一直运行到 Ctrl-C
     #[arg(long, default_value_t = 0)]
-    duration_ms: u64,
+    pub(crate) duration_ms: u64,
 
     /// 判定按下的下降幅度（相对基线）；灵敏度不够时调小
     #[arg(long, default_value_t = 150)]
-    press_delta: u16,
-}
-
-struct HeadlessPlatform {
-    window: Rc<MinimalSoftwareWindow>,
-    start: Instant,
-}
-
-impl Platform for HeadlessPlatform {
-    fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
-        Ok(self.window.clone())
-    }
-
-    fn duration_since_start(&self) -> Duration {
-        self.start.elapsed()
-    }
-
-    fn run_event_loop(&self) -> Result<(), slint::PlatformError> {
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct Stats {
-    rendered: u64,
-    sent: u64,
-    dirty_tiles: u64,
-    rects: u64,
-    bytes: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AppState {
-    page: usize,
-}
-
-impl AppState {
-    fn new() -> Self {
-        Self { page: 0 }
-    }
-
-    fn advance(&mut self) {
-        self.page = (self.page + 1) % PAGES;
-    }
-}
-
-fn refresh_ui(ui: &AppWindow, state: &AppState, button: &ButtonState) {
-    ui.set_page(state.page as i32);
-    ui.set_pressed(button.is_pressed());
+    pub(crate) press_delta: u16,
 }
 
 #[tokio::main]
@@ -109,11 +65,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
-    slint::platform::set_platform(Box::new(HeadlessPlatform {
-        window: window.clone(),
-        start: Instant::now(),
-    }))
-    .expect("Slint platform was already initialized");
+    app::install_platform(window.clone());
 
     let ui = AppWindow::new().context("failed to build the Slint UI")?;
     window.set_size(slint::PhysicalSize::new(WIDTH as u32, HEIGHT as u32));
@@ -251,60 +203,4 @@ async fn main() -> anyhow::Result<()> {
     );
 
     Ok(())
-}
-
-async fn connect(cli: &Cli) -> anyhow::Result<Msu2Device> {
-    let mut device = match &cli.port {
-        Some(port) => Msu2Device::connect(port.clone(), BAUDRATE, CONNECT_TIMEOUT)
-            .await
-            .with_context(|| format!("failed to connect to MSU2 on {port}"))?,
-        None => Msu2Device::auto_connect(BAUDRATE, CONNECT_TIMEOUT)
-            .await
-            .context("no MSU2 device found; pass --port")?,
-    };
-    device
-        .initialize()
-        .await
-        .context("failed to initialize MSU2")?;
-    println!("connected to {}", device.path());
-    Ok(device)
-}
-
-fn copy_pixels(pixels: &[Rgb565Pixel], out: &mut [u16]) {
-    for (slot, pixel) in out.iter_mut().zip(pixels) {
-        *slot = pixel.0;
-    }
-}
-
-async fn send_full_frame(device: &mut Msu2Device, frame: &[u16]) -> anyhow::Result<usize> {
-    let bytes = rgb565_bytes(frame);
-    let len = bytes.len();
-    tokio::time::timeout(
-        STREAM_TIMEOUT,
-        device.display_frame(0, 0, WIDTH as u16, HEIGHT as u16, &bytes),
-    )
-    .await
-    .map_err(|_| anyhow!("initial frame write timed out"))?
-    .context("failed to stream the initial frame")?;
-    Ok(len)
-}
-
-async fn send_tiles(
-    device: &mut Msu2Device,
-    frame: &[u16],
-    rects: &[Rect],
-) -> anyhow::Result<usize> {
-    let bytes = tokio::time::timeout(
-        STREAM_TIMEOUT,
-        device.stream_tiles(frame, WIDTH as u16, rects),
-    )
-    .await
-    .map_err(|_| {
-        anyhow!(
-            "tile write timed out after {STREAM_TIMEOUT:?}; firmware likely hung, \
-             unplug/replug the screen-side USB"
-        )
-    })?
-    .context("failed to stream tiles")?;
-    Ok(bytes)
 }
