@@ -258,6 +258,14 @@ impl<T: Transport> Msu2Device<T> {
         self.transport.send(&packet).await
     }
 
+    /// 等待 LCD 传输完成（`02 03 09`）。
+    ///
+    /// 厂商 Demo 在每帧数据末尾都会发这一条命令，让固件把尚未落盘的
+    /// 页缓冲推给 LCD。
+    pub async fn lcd_sync(&mut self) -> Result<(), Error> {
+        self.transport.send(&protocol::lcd_sync()).await
+    }
+
     /// 用固件的 `02 04` 填充字路径填充矩形。
     ///
     /// 这是厂商 Demo `Write_LCD_Screen_fast` 使用的优化路径：每个 256 字节

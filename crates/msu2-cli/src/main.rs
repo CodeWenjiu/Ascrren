@@ -111,8 +111,8 @@ enum Command {
         #[arg(long, default_value_t = 10_000)]
         duration_ms: u64,
 
-        /// 每帧之间的停顿（毫秒）；0 表示全速发送
-        #[arg(long, default_value_t = 0)]
+        /// 每帧之间的停顿（毫秒）；0 表示全速发送（会出现拖影）
+        #[arg(long, default_value_t = 16)]
         step_ms: u64,
 
         /// 方块边长（像素）
@@ -120,12 +120,16 @@ enum Command {
         block: u16,
 
         /// 每帧移动的像素数
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 2)]
         speed: u16,
 
-        /// 把相邻脏 tile 合并成矩形并一次写入（更快，但合并序列尚未在实机验证）
+        /// 把相邻脏 tile 合并成矩形并一次写入
         #[arg(long)]
         merge: bool,
+
+        /// 每帧末尾发送 02 03 09（与厂商 Demo 一致）
+        #[arg(long)]
+        sync: bool,
 
         /// 明知增量刷新仍是实验路径仍要尝试
         #[arg(long)]
@@ -376,6 +380,7 @@ async fn run() -> anyhow::Result<()> {
             block,
             speed,
             merge,
+            sync,
             force,
         } => {
             let mut device = connect(&cli).await?;
@@ -385,6 +390,7 @@ async fn run() -> anyhow::Result<()> {
                 block,
                 speed,
                 merge,
+                sync,
             };
             cmd_animate(&mut device, &spec, force).await
         }
@@ -714,6 +720,7 @@ struct AnimateSpec {
     block: u16,
     speed: u16,
     merge: bool,
+    sync: bool,
 }
 
 /// 单次增量写入的最长等待时间。固件卡死时写操作会因 USB 流控永久阻塞。
@@ -755,14 +762,22 @@ async fn cmd_animate(
         .context("failed to draw the initial frame")?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     println!(
-        "initial frame sent; animating for {} ms (block {block}px, speed {speed}px/frame, {})",
+        "initial frame sent; animating for {} ms (block {block}px, speed {speed}px/frame, {}, {})",
         spec.duration_ms,
         if spec.merge {
             "merged rects"
         } else {
             "per-tile"
+        },
+        if spec.step_ms == 0 {
+            "unthrottled".to_owned()
+        } else {
+            format!("{} ms/frame", spec.step_ms)
         }
     );
+    if spec.step_ms == 0 {
+        println!("warning: unthrottled mode can outrun the panel and produce ghosting");
+    }
 
     let started = Instant::now();
     let deadline = started + Duration::from_millis(spec.duration_ms);
@@ -838,6 +853,9 @@ async fn cmd_animate(
                         rects_total += count as u64;
                     }
                     frames += 1;
+                    if spec.sync {
+                        device.lcd_sync().await.context("failed to sync LCD")?;
+                    }
                     previous.copy_from_slice(&frame);
                 }
                 Err(error) => {
