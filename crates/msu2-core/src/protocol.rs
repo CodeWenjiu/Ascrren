@@ -16,7 +16,6 @@ pub const SFR_WRITE_U8: u8 = 0x80;
 pub const SFR_WRITE_U16: u8 = 0xA0;
 
 pub const CMD_ADC: u8 = 0x08;
-pub const CMD_FLASH: u8 = 0x03;
 pub const CMD_DATA: u8 = 0x04;
 pub const CMD_LCD: u8 = 0x02;
 
@@ -124,18 +123,6 @@ pub fn adc_read(channel: u8) -> [u8; 6] {
     [CMD_ADC, channel, 0, 0, 0, 0]
 }
 
-/// 读 Flash 字节：`03 00 addr_hi addr_mid addr_lo 00`。
-pub fn flash_read_byte(address: u32) -> [u8; 6] {
-    [
-        CMD_FLASH,
-        0x00,
-        (address >> 16) as u8,
-        (address >> 8) as u8,
-        address as u8,
-        0,
-    ]
-}
-
 /// 设置 LCD 起始坐标：`02 00 x_hi x_lo y_hi y_lo`。
 pub fn lcd_set_xy(x: u16, y: u16) -> [u8; 6] {
     [
@@ -177,11 +164,6 @@ pub fn lcd_ascii_32x64(ch: u8, font_page: u16) -> [u8; 6] {
         (font_page >> 8) as u8,
         font_page as u8,
     ]
-}
-
-/// 显示 16×16 GB2312 字符：`02 03 03 gb_hi gb_lo 00`。
-pub fn lcd_gb2312_16x16(gb_hi: u8, gb_lo: u8) -> [u8; 6] {
-    [CMD_LCD, 0x03, 0x03, gb_hi, gb_lo, 0]
 }
 
 /// 显示 Flash 中的彩色图片：`02 03 00 page_hi page_lo 00`。

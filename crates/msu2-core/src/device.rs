@@ -127,11 +127,6 @@ impl<T: Transport> Msu2Device<T> {
         self.read_adc(9).await.map(|_| ())
     }
 
-    /// 读外部 Flash 的一个字节。
-    pub async fn read_flash_byte(&mut self, address: u32) -> Result<u8, Error> {
-        Ok(self.request(protocol::flash_read_byte(address)).await?[5])
-    }
-
     /// 连续读取一段 SFR 字节。
     pub async fn read_sfr_block(&mut self, start: u16, len: usize) -> Result<Vec<u8>, Error> {
         let mut data = Vec::with_capacity(len);
@@ -195,82 +190,7 @@ impl<T: Transport> Msu2Device<T> {
         }
     }
 
-    /// 发送原始字节，不等待响应。
-    pub async fn send_raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.transport.send(bytes).await
-    }
-
-    /// 读取下一帧（用于 `raw` 命令调试）。
-    pub async fn next_frame(&mut self, timeout: Duration) -> Result<Frame, Error> {
-        self.transport.next_frame(timeout).await
-    }
-
-    /// 用纯色填充矩形。
-    ///
-    /// 显式预载每个 256 字节块的 64 个 4 字节字，再调用 `02 03 08` 刷出，
-    /// 避免依赖 `02 04` 填充字命令。该操作只写不读，适合作为显示链路的冒烟测试。
-    pub async fn fill_rect(
-        &mut self,
-        x: u16,
-        y: u16,
-        width: u16,
-        height: u16,
-        color: u16,
-    ) -> Result<(), Error> {
-        if width == 0 || height == 0 {
-            return Ok(());
-        }
-
-        // 固件刚完成握手时 LCD/命令状态尚未稳定，先留出一段稳定期。
-        #[cfg(not(test))]
-        {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-        }
-
-        let total_bytes = u32::from(width) * u32::from(height) * 2;
-        let chunks = total_bytes.div_ceil(256) as usize;
-        let [color_hi, color_lo] = color.to_be_bytes();
-        let color_word = [color_hi, color_lo, color_hi, color_lo];
-
-        // 参考实现会逐条发送窗口设置，并在 LCD_ADD 后等待设备响应。
-        // 这里分开发送并留出建立时间，避免固件尚未准备好就开始 DMA。
-        self.transport.send(&protocol::lcd_set_xy(x, y)).await?;
-        #[cfg(not(test))]
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        self.transport
-            .send(&protocol::lcd_set_size(width, height))
-            .await?;
-        #[cfg(not(test))]
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        self.transport.send(&protocol::lcd_stream_start()).await?;
-        // 参考实现会在 LCD_ADD 后等待任意一帧（通常是心跳），再开始发数据。
-        #[cfg(not(test))]
-        {
-            let _ = self.transport.next_frame(Duration::from_millis(1000)).await;
-        }
-
-        let mut packet = Vec::with_capacity(chunks * (64 * 6 + 6) + 6);
-        let mut remaining = total_bytes;
-        while remaining > 0 {
-            let chunk = remaining.min(256) as u16;
-            for index in 0..64u8 {
-                packet.extend_from_slice(&[
-                    protocol::CMD_DATA,
-                    index,
-                    color_word[0],
-                    color_word[1],
-                    color_word[2],
-                    color_word[3],
-                ]);
-            }
-            packet.extend_from_slice(&protocol::lcd_flush_chunk(chunk));
-            remaining -= u32::from(chunk);
-        }
-
-        packet.extend_from_slice(&protocol::lcd_sync());
-        self.transport.send(&packet).await
-    }
-
+    /// 用固件的 `02 04` 填充字路径填充矩形。
     /// 等待 LCD 传输完成（`02 03 09`）。
     ///
     /// 厂商 Demo 在每帧数据末尾都会发这一条命令，让固件把尚未落盘的
@@ -421,27 +341,7 @@ impl<T: Transport> Msu2Device<T> {
         Ok(())
     }
 
-    /// 用内置 16×16 GB2312 字库显示一个字符（传入 GB2312 双字节编码）。
-    pub async fn display_gb2312(
-        &mut self,
-        x: u16,
-        y: u16,
-        gb_hi: u8,
-        gb_lo: u8,
-        fg: u16,
-        bg: u16,
-    ) -> Result<(), Error> {
-        self.transport.send(&protocol::lcd_set_xy(x, y)).await?;
-        self.transport
-            .send(&protocol::lcd_set_color(fg, bg))
-            .await?;
-        self.transport
-            .send(&protocol::lcd_gb2312_16x16(gb_hi, gb_lo))
-            .await?;
-        let _ = self.transport.next_frame(Duration::from_millis(1000)).await;
-        Ok(())
-    }
-
+    /// 用内置 32×64 ASCII 字库显示一个字符。
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -553,25 +453,5 @@ mod tests {
             device.transport.sent[3],
             [protocol::lcd_set_fill(0xF800), protocol::lcd_flush_chunk(4)].concat()
         );
-    }
-
-    #[tokio::test]
-    async fn fill_rect_batches_stream_commands() {
-        let mut device = mock_device([]);
-        device.fill_rect(0, 0, 1, 1, 0xF800).await.unwrap();
-
-        assert_eq!(device.transport.sent.len(), 4);
-        assert_eq!(device.transport.sent[0], protocol::lcd_set_xy(0, 0));
-        assert_eq!(device.transport.sent[1], protocol::lcd_set_size(1, 1));
-        assert_eq!(device.transport.sent[2], protocol::lcd_stream_start());
-
-        let packet = &device.transport.sent[3];
-        assert_eq!(packet.len(), 64 * 6 + 6 + 6);
-        assert_eq!(
-            &packet[..6],
-            &[protocol::CMD_DATA, 0x00, 0xF8, 0x00, 0xF8, 0x00]
-        );
-        assert_eq!(&packet[64 * 6..64 * 6 + 6], &protocol::lcd_flush_chunk(2));
-        assert_eq!(&packet[packet.len() - 6..], &protocol::lcd_sync());
     }
 }

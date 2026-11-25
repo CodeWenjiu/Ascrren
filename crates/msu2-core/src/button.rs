@@ -48,6 +48,8 @@ pub struct ButtonConfig {
     pub rearm_samples: u8,
     /// 判定为安静的电平幅度：值恢复到 `baseline - rearm_delta` 以上。
     pub rearm_delta: u16,
+    /// 长时间无法重新武装时强制放行，避免电平卡在中间导致按键彻底失效。
+    pub rearm_timeout: Duration,
     /// 是否在空闲时跟踪基线漂移。
     ///
     /// 默认关闭——ADC 噪声会让 EMA 随机游走，反而使阈值漂移。
@@ -59,15 +61,16 @@ pub struct ButtonConfig {
 impl Default for ButtonConfig {
     fn default() -> Self {
         Self {
-            press_delta: 125,
-            release_delta: 80,
+            press_delta: 150,
+            release_delta: 100,
             calibration_samples: 8,
             debounce_samples: 2,
             release_debounce_samples: 2,
-            median_window: 3,
-            release_lockout: Duration::from_millis(250),
-            rearm_samples: 3,
-            rearm_delta: 40,
+            median_window: 5,
+            release_lockout: Duration::from_millis(800),
+            rearm_samples: 5,
+            rearm_delta: 30,
+            rearm_timeout: Duration::from_secs(5),
             track_baseline: false,
             baseline_ema_shift: 6,
         }
@@ -96,11 +99,8 @@ pub struct ButtonState {
     config: ButtonConfig,
     phase: Phase,
     calibration: Vec<u16>,
-    calibration_min: u16,
-    calibration_max: u16,
     baseline: u32,
     history: Vec<u16>,
-    last_filtered: u16,
     candidate: Option<bool>,
     candidate_samples: u8,
     candidate_since: Option<Instant>,
@@ -115,11 +115,8 @@ impl ButtonState {
             config,
             phase: Phase::Calibrating,
             calibration: Vec::with_capacity(usize::from(config.calibration_samples)),
-            calibration_min: 0,
-            calibration_max: 0,
             baseline: 0,
             history: Vec::with_capacity(usize::from(config.median_window).max(1)),
-            last_filtered: 0,
             candidate: None,
             candidate_samples: 0,
             candidate_since: None,
@@ -139,40 +136,17 @@ impl ButtonState {
         self.baseline
     }
 
-    /// 校准样本的极差；很大说明校准时手在动，结果不可信。
-    pub fn calibration_spread(&self) -> u16 {
-        self.calibration_max.saturating_sub(self.calibration_min)
-    }
-
-    /// 最近一次采样经过中值滤波后的值。
-    pub fn last_filtered(&self) -> u16 {
-        self.last_filtered
-    }
-
     /// 当前是否处于按下状态。
     pub fn is_pressed(&self) -> bool {
         matches!(self.phase, Phase::Pressed { .. })
     }
 
-    /// 低于这个值判定为按下。
-    pub fn press_threshold(&self) -> u32 {
-        self.config.press_threshold(self.baseline)
-    }
-
-    /// 高于这个值判定为释放。
-    pub fn release_threshold(&self) -> u32 {
-        self.config.release_threshold(self.baseline)
-    }
-
-    /// 是否允许新的按下。
-    pub fn is_armed(&self) -> bool {
-        self.armed
-    }
-
-    /// 跳过校准，直接使用指定基线（调试用）。
-    pub fn set_baseline(&mut self, baseline: u32) {
-        self.baseline = baseline;
-        self.phase = Phase::Idle;
+    /// 是否需要更密的采样。
+    ///
+    /// 按住中或等待电平恢复时，状态可能在两次采样之间变化，需要高频
+    /// 盯紧；完全空闲时可以降频，减少 USB 往返。
+    pub fn needs_fast_sampling(&self) -> bool {
+        !self.armed || matches!(self.phase, Phase::Pressed { .. })
     }
 
     /// 输入一次采样，在释放时返回这次按压。
@@ -181,8 +155,6 @@ impl ButtonState {
             self.calibration.push(raw);
             if self.calibration.len() >= usize::from(self.config.calibration_samples.max(1)) {
                 self.calibration.sort_unstable();
-                self.calibration_min = self.calibration[0];
-                self.calibration_max = self.calibration[self.calibration.len() - 1];
                 self.baseline = u32::from(self.calibration[self.calibration.len() / 2]);
                 self.phase = Phase::Idle;
             }
@@ -190,7 +162,6 @@ impl ButtonState {
         }
 
         let raw = self.filter(raw);
-        self.last_filtered = raw;
 
         // 空闲且开启跟踪时缓慢修正温漂；按下期间冻结基线，避免把按压
         // 本身当成漂移吸收掉。默认关闭，因为 ADC 噪声会让 EMA 随机游走。
@@ -215,15 +186,23 @@ impl ButtonState {
         // 重新武装：必须先看到电平回到安静区间并保持若干次，才接受
         // 下一次按下。这样即使松手后电平停在低位，也不会重复触发。
         if !self.armed {
-            let quiet_level = baseline.saturating_sub(u32::from(self.config.rearm_delta));
-            if u32::from(raw) >= quiet_level {
-                self.rearm_quiet = self.rearm_quiet.saturating_add(1);
-                if self.rearm_quiet >= self.config.rearm_samples.max(1) {
-                    self.armed = true;
+            let timed_out = self.last_release.is_some_and(|released| {
+                now.saturating_duration_since(released) >= self.config.rearm_timeout
+            });
+            if timed_out {
+                self.armed = true;
+                self.rearm_quiet = 0;
+            } else {
+                let quiet_level = baseline.saturating_sub(u32::from(self.config.rearm_delta));
+                if u32::from(raw) >= quiet_level {
+                    self.rearm_quiet = self.rearm_quiet.saturating_add(1);
+                    if self.rearm_quiet >= self.config.rearm_samples.max(1) {
+                        self.armed = true;
+                        self.rearm_quiet = 0;
+                    }
+                } else {
                     self.rearm_quiet = 0;
                 }
-            } else {
-                self.rearm_quiet = 0;
             }
         }
 
@@ -305,6 +284,8 @@ mod tests {
             debounce_samples: 2,
             release_debounce_samples: 2,
             median_window: 1,
+            release_lockout: Duration::from_millis(250),
+            rearm_samples: 3,
             ..ButtonConfig::default()
         }
     }
@@ -404,14 +385,12 @@ mod tests {
         state.sample(800, at(start, 10));
         state.sample(1000, at(start, 20));
         assert!(state.sample(1000, at(start, 30)).is_some());
-        assert!(!state.is_armed());
 
         // 电平一直停在低位：不应再触发任何按压。
         for index in 0..60u64 {
             assert_eq!(state.sample(700, at(start, 100 + index * 10)), None);
         }
         assert!(!state.is_pressed());
-        assert!(!state.is_armed());
     }
 
     #[test]
@@ -427,7 +406,6 @@ mod tests {
         state.sample(1015, at(start, 400));
         state.sample(1015, at(start, 410));
         state.sample(1015, at(start, 420));
-        assert!(state.is_armed());
 
         state.sample(800, at(start, 430));
         state.sample(800, at(start, 440));
@@ -457,7 +435,6 @@ mod tests {
         state.sample(1000, at(start, 0));
         state.sample(700, at(start, 10));
         state.sample(700, at(start, 20));
-        assert_eq!(state.last_filtered(), 700);
         state.sample(700, at(start, 30));
         assert!(state.is_pressed());
     }
@@ -491,8 +468,20 @@ mod tests {
     }
 
     #[test]
-    fn reports_calibration_spread() {
-        let (state, _) = calibrated();
-        assert_eq!(state.calibration_spread(), 1100 - 980);
+    fn rearm_timeout_forces_the_button_back_on() {
+        let (mut state, start) = calibrated();
+
+        state.sample(800, start);
+        state.sample(800, at(start, 10));
+        state.sample(1000, at(start, 20));
+        assert!(state.sample(1000, at(start, 30)).is_some());
+
+        // 电平一直停在低位，超过 rearm_timeout 后强制重新武装。
+        for index in 0..10u64 {
+            assert_eq!(state.sample(700, at(start, 200 + index * 10)), None);
+        }
+        state.sample(700, at(start, 5200));
+        state.sample(700, at(start, 5210));
+        assert!(state.is_pressed());
     }
 }

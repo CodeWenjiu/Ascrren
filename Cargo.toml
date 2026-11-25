@@ -8,7 +8,6 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
-crate-macro = { path = "crates/crate_macro" }
 msu2-core = { path = "crates/msu2-core" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "io-util", "sync", "signal"] }
 tokio-serial = { version = "5.5", features = ["libudev"] }

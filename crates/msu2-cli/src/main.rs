@@ -1,13 +1,9 @@
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use msu2_core::display::{TileGrid, rgb565_bytes};
-use msu2_core::{Frame, Msu2Device, STREAM_TIMEOUT, SfrValue};
+use msu2_core::{Msu2Device, SfrValue};
 
 #[derive(Debug, Parser)]
 #[command(name = "msu2", version, about = "MSU2 USB 副屏跨平台命令行工具")]
@@ -23,10 +19,6 @@ struct Cli {
     /// 命令/握手超时时间（毫秒）；固件在主机断开后需要几秒恢复心跳
     #[arg(long, global = true, default_value_t = 8000)]
     timeout_ms: u64,
-
-    /// 跳过 MSNCN 握手（仅用于设备恢复/调试）
-    #[arg(long, global = true)]
-    no_handshake: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -105,37 +97,6 @@ enum Command {
         hold_ms: u64,
     },
 
-    /// 用增量 tile 刷新驱动一个移动方块，验证更新路径并测量实际吞吐
-    Animate {
-        /// 运行时长（毫秒）
-        #[arg(long, default_value_t = 10_000)]
-        duration_ms: u64,
-
-        /// 每帧之间的停顿（毫秒）；0 表示全速发送（会出现拖影）
-        #[arg(long, default_value_t = 16)]
-        step_ms: u64,
-
-        /// 方块边长（像素）
-        #[arg(long, default_value_t = 24)]
-        block: u16,
-
-        /// 每帧移动的像素数
-        #[arg(long, default_value_t = 2)]
-        speed: u16,
-
-        /// 把相邻脏 tile 合并成矩形并一次写入
-        #[arg(long)]
-        merge: bool,
-
-        /// 每帧末尾发送 02 03 09（与厂商 Demo 一致）
-        #[arg(long)]
-        sync: bool,
-
-        /// 明知增量刷新仍是实验路径仍要尝试
-        #[arg(long)]
-        force: bool,
-    },
-
     /// 显示外部 Flash 中预存的彩色图片
     Photo {
         /// Flash 页号；0 对应出厂图片 1
@@ -178,27 +139,6 @@ enum Command {
         /// ASCII 字库在 Flash 中的起始页
         #[arg(long, default_value_t = 3651)]
         font_page: u16,
-    },
-
-    /// 用内置 16×16 字库显示一个 GB2312 字符（实验性，当前固件可能没有字库）
-    Gb2312 {
-        /// GB2312 双字节编码（十六进制），例如 D6D0 = 中
-        #[arg(long, default_value = "D6D0")]
-        code: String,
-
-        #[arg(long, default_value_t = 10)]
-        x: u16,
-
-        #[arg(long, default_value_t = 10)]
-        y: u16,
-
-        /// 前景色 RRGGBB
-        #[arg(long, default_value = "FFFFFF")]
-        fg: String,
-
-        /// 背景色 RRGGBB
-        #[arg(long, default_value = "000000")]
-        bg: String,
     },
 
     /// 用内置 32×64 ASCII 字库显示多字符文本
@@ -251,62 +191,6 @@ enum Command {
         /// ASCII 字库在 Flash 中的起始页
         #[arg(long, default_value_t = 3651)]
         font_page: u16,
-    },
-
-    /// 读取外部 Flash 的一段字节（调试用）
-    FlashRead {
-        /// 起始字节地址
-        #[arg(long, default_value_t = 0)]
-        address: u32,
-
-        /// 读取长度（字节）
-        #[arg(long, default_value_t = 64)]
-        length: u32,
-    },
-
-    /// 将外部 Flash 的一段字节原样备份到文件
-    FlashDump {
-        /// 起始字节地址
-        #[arg(long, default_value_t = 0)]
-        address: u32,
-
-        /// 读取长度（字节）
-        #[arg(long)]
-        length: u32,
-
-        /// 输出文件路径
-        #[arg(long, value_name = "FILE")]
-        output: PathBuf,
-    },
-
-    /// 通过 USB hub 端口断电重启 MSU2（Linux/uhubctl）
-    Reset {
-        /// uhubctl hub 位置，例如 3-2；省略时自动查找
-        #[arg(long)]
-        hub: Option<String>,
-
-        /// hub 端口号；省略时自动查找
-        #[arg(long)]
-        hub_port: Option<u8>,
-
-        /// 等待设备重新枚举的时间（毫秒）
-        #[arg(long, default_value_t = 10_000)]
-        wait_ms: u64,
-    },
-
-    /// 发送原始十六进制字节并打印一帧响应
-    Raw {
-        /// 例如 "00 30 00 01 00 00"
-        #[arg(value_name = "HEX")]
-        hex: String,
-
-        /// 发送前先执行 MSNCN 握手
-        #[arg(long)]
-        handshake: bool,
-
-        /// 发送命令前的等待时间（毫秒）
-        #[arg(long, default_value_t = 0)]
-        delay_ms: u64,
     },
 }
 
@@ -374,26 +258,6 @@ async fn run() -> anyhow::Result<()> {
             )
             .await
         }
-        Command::Animate {
-            duration_ms,
-            step_ms,
-            block,
-            speed,
-            merge,
-            sync,
-            force,
-        } => {
-            let mut device = connect(&cli).await?;
-            let spec = AnimateSpec {
-                duration_ms,
-                step_ms,
-                block,
-                speed,
-                merge,
-                sync,
-            };
-            cmd_animate(&mut device, &spec, force).await
-        }
         Command::Photo {
             page,
             x,
@@ -414,16 +278,6 @@ async fn run() -> anyhow::Result<()> {
         } => {
             let mut device = connect(&cli).await?;
             cmd_ascii(&mut device, text, x, y, fg, bg, font_page).await
-        }
-        Command::Gb2312 {
-            ref code,
-            x,
-            y,
-            ref fg,
-            ref bg,
-        } => {
-            let mut device = connect(&cli).await?;
-            cmd_gb2312(&mut device, code, x, y, fg, bg).await
         }
         Command::Text {
             ref text,
@@ -453,29 +307,6 @@ async fn run() -> anyhow::Result<()> {
             let mut device = connect(&cli).await?;
             cmd_clear(&mut device, bg, font_page).await
         }
-        Command::FlashRead { address, length } => {
-            let mut device = connect(&cli).await?;
-            cmd_flash_read(&mut device, address, length).await
-        }
-        Command::FlashDump {
-            address,
-            length,
-            ref output,
-        } => {
-            let mut device = connect(&cli).await?;
-            cmd_flash_dump(&mut device, address, length, output).await
-        }
-
-        Command::Raw {
-            ref hex,
-            handshake,
-            delay_ms,
-        } => cmd_raw(&cli, hex, handshake, delay_ms).await,
-        Command::Reset {
-            ref hub,
-            hub_port,
-            wait_ms,
-        } => cmd_reset(&cli, hub.as_deref(), hub_port, wait_ms).await,
     }
 }
 
@@ -483,23 +314,14 @@ async fn connect(cli: &Cli) -> anyhow::Result<Msu2Device> {
     let path = resolve_port(cli)?;
     let timeout = Duration::from_millis(cli.timeout_ms);
 
-    if cli.no_handshake {
-        Msu2Device::open(path.clone(), cli.baud, timeout).with_context(|| {
+    Msu2Device::connect(path.clone(), cli.baud, timeout)
+        .await
+        .with_context(|| {
             format!(
-                "failed to open MSU2 on {path}; check the USB cable, permissions \
+                "failed to connect to MSU2 on {path}; check the USB cable, permissions \
                  (dialout/uucp group or udev rule), and whether another program owns the port"
             )
         })
-    } else {
-        Msu2Device::connect(path.clone(), cli.baud, timeout)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to connect to MSU2 on {path}; check the USB cable, permissions \
-                     (dialout/uucp group or udev rule), and whether another program owns the port"
-                )
-            })
-    }
 }
 
 fn resolve_port(cli: &Cli) -> anyhow::Result<String> {
@@ -714,185 +536,7 @@ async fn cmd_frame(
     Ok(())
 }
 
-struct AnimateSpec {
-    duration_ms: u64,
-    step_ms: u64,
-    block: u16,
-    speed: u16,
-    merge: bool,
-    sync: bool,
-}
-
-/// 在一个长驻的 framebuffer 上移动方块，只发送变化的 tile。
-///
-/// 这是 GUI 增量刷新的最小模拟：每帧重建目标画面，与上一帧做 tile
-/// 差分并合并矩形，再通过 `stream_tiles` 一次写入 USB。
-async fn cmd_animate(
-    device: &mut Msu2Device,
-    spec: &AnimateSpec,
-    force: bool,
-) -> anyhow::Result<()> {
-    if !force {
-        bail!("incremental tile streaming is still experimental; pass --force to try it");
-    }
-
-    const WIDTH: usize = 160;
-    const HEIGHT: usize = 80;
-    const TILE: u16 = 16;
-
-    let block = spec.block.max(TILE);
-    if usize::from(block) > WIDTH {
-        bail!("--block must be at most {WIDTH}");
-    }
-    let speed = spec.speed.max(1) as i32;
-    let grid =
-        TileGrid::new(WIDTH as u16, HEIGHT as u16, TILE).context("failed to build tile grid")?;
-
-    let mut frame = vec![0u16; WIDTH * HEIGHT];
-    device
-        .initialize()
-        .await
-        .context("failed to initialize MSU2")?;
-    device
-        .display_frame(0, 0, WIDTH as u16, HEIGHT as u16, &rgb565_bytes(&frame))
-        .await
-        .context("failed to draw the initial frame")?;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    println!(
-        "initial frame sent; animating for {} ms (block {block}px, speed {speed}px/frame, {}, {})",
-        spec.duration_ms,
-        if spec.merge {
-            "merged rects"
-        } else {
-            "per-tile"
-        },
-        if spec.step_ms == 0 {
-            "unthrottled".to_owned()
-        } else {
-            format!("{} ms/frame", spec.step_ms)
-        }
-    );
-    if spec.step_ms == 0 {
-        println!("warning: unthrottled mode can outrun the panel and produce ghosting");
-    }
-
-    let started = Instant::now();
-    let deadline = started + Duration::from_millis(spec.duration_ms);
-    let mut previous = frame.clone();
-    let mut frames = 0u64;
-    let mut sent_bytes = 0u64;
-    let mut dirty_tiles_total = 0u64;
-    let mut rects_total = 0u64;
-    let mut position = 0i32;
-    let mut direction = 1i32;
-    let mut failures = 0u32;
-
-    while Instant::now() < deadline {
-        frame.fill(0);
-        for row in 0..usize::from(block) {
-            let y = 16 + row;
-            if y >= HEIGHT {
-                break;
-            }
-            let start = position.max(0) as usize;
-            let end = (position + i32::from(block)).clamp(0, WIDTH as i32) as usize;
-            frame[y * WIDTH + start..y * WIDTH + end].fill(0xF800);
-        }
-
-        let dirty = grid.diff(&previous, &frame).context("tile diff failed")?;
-        if !dirty.is_empty() {
-            let result = if spec.merge {
-                let rects = grid.merge_tiles(&dirty);
-                rects_total += rects.len() as u64;
-                match tokio::time::timeout(
-                    STREAM_TIMEOUT,
-                    device.stream_tiles(&frame, WIDTH as u16, &rects),
-                )
-                .await
-                {
-                    Ok(result) => result.map(|bytes| (bytes, rects.len())),
-                    Err(_) => bail!(
-                        "tile write timed out after {STREAM_TIMEOUT:?}; \
-                         firmware likely hung, unplug/replug the screen-side USB"
-                    ),
-                }
-            } else {
-                // 保守模式：每个 tile 单独一次写入，避免未验证的合并序列。
-                let mut bytes = 0usize;
-                let mut result = Ok(());
-                for tile in &dirty {
-                    match tokio::time::timeout(
-                        STREAM_TIMEOUT,
-                        device.stream_tiles(&frame, WIDTH as u16, &[grid.tile_rect(*tile)]),
-                    )
-                    .await
-                    {
-                        Ok(Ok(sent)) => bytes += sent,
-                        Ok(Err(error)) => {
-                            result = Err(error);
-                            break;
-                        }
-                        Err(_) => bail!(
-                            "tile write timed out after {STREAM_TIMEOUT:?}; \
-                             firmware likely hung, unplug/replug the screen-side USB"
-                        ),
-                    }
-                }
-                result.map(|()| (bytes, dirty.len()))
-            };
-
-            match result {
-                Ok((bytes, count)) => {
-                    failures = 0;
-                    sent_bytes += bytes as u64;
-                    dirty_tiles_total += dirty.len() as u64;
-                    if !spec.merge {
-                        rects_total += count as u64;
-                    }
-                    frames += 1;
-                    if spec.sync {
-                        device.lcd_sync().await.context("failed to sync LCD")?;
-                    }
-                    previous.copy_from_slice(&frame);
-                }
-                Err(error) => {
-                    failures += 1;
-                    if failures >= 2 {
-                        bail!(
-                            "device stopped responding after tile update ({error}); \
-                             unplug/replug the screen-side USB to recover"
-                        );
-                    }
-                }
-            }
-        }
-
-        position += speed * direction;
-        if position <= 0 {
-            position = 0;
-            direction = 1;
-        } else if position + i32::from(block) >= WIDTH as i32 {
-            position = WIDTH as i32 - i32::from(block);
-            direction = -1;
-        }
-
-        if spec.step_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(spec.step_ms)).await;
-        }
-    }
-
-    let elapsed = started.elapsed().as_secs_f64();
-    println!(
-        "animated {frames} frames in {elapsed:.2}s ({:.1} fps)",
-        frames as f64 / elapsed.max(f64::EPSILON)
-    );
-    println!(
-        "tile updates={dirty_tiles_total} merged rects={rects_total} wire_bytes={sent_bytes} ({:.0} B/frame)",
-        sent_bytes as f64 / frames.max(1) as f64
-    );
-    Ok(())
-}
-
+/// 保持连接一段时间，期间只读 ADC 保活。
 async fn hold_session(device: &mut Msu2Device, hold_ms: u64) -> anyhow::Result<()> {
     if hold_ms == 0 {
         return Ok(());
@@ -976,38 +620,6 @@ async fn cmd_ascii(
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     println!("displayed ASCII {text:?} at ({x}, {y}) font_page={font_page}");
-    Ok(())
-}
-
-async fn cmd_gb2312(
-    device: &mut Msu2Device,
-    code: &str,
-    x: u16,
-    y: u16,
-    fg: &str,
-    bg: &str,
-) -> anyhow::Result<()> {
-    let code = parse_hex_bytes(code)?;
-    if code.len() != 2 {
-        bail!("--code must be exactly two hex bytes, e.g. D6D0");
-    }
-    let fg = parse_rgb565(fg)?;
-    let bg = parse_rgb565(bg)?;
-
-    device
-        .initialize()
-        .await
-        .context("failed to initialize MSU2")?;
-    device
-        .display_gb2312(x, y, code[0], code[1], fg, bg)
-        .await
-        .context("failed to display GB2312 glyph")?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    println!(
-        "displayed GB2312 {:02X}{:02X} at ({x}, {y})",
-        code[0], code[1]
-    );
     Ok(())
 }
 
@@ -1121,314 +733,6 @@ async fn draw_text(device: &mut Msu2Device, text: &str, style: TextStyle) -> any
     Ok(())
 }
 
-async fn cmd_flash_dump(
-    device: &mut Msu2Device,
-    address: u32,
-    length: u32,
-    output: &PathBuf,
-) -> anyhow::Result<()> {
-    if length == 0 {
-        bail!("dump length must be greater than zero");
-    }
-    address
-        .checked_add(length)
-        .context("flash dump range overflows a 32-bit address")?;
-
-    device
-        .initialize()
-        .await
-        .context("failed to initialize MSU2")?;
-
-    let file = File::create(output)
-        .with_context(|| format!("failed to create dump file {}", output.display()))?;
-    let mut writer = BufWriter::new(file);
-    let mut written = 0u32;
-
-    // 单次请求只返回 1 字节；按块写入文件，避免把整段数据堆在内存里。
-    const CHUNK: u32 = 4096;
-    while written < length {
-        let count = CHUNK.min(length - written);
-        let mut chunk = Vec::with_capacity(count as usize);
-        for offset in 0..count {
-            chunk.push(device.read_flash_byte(address + written + offset).await?);
-        }
-        writer
-            .write_all(&chunk)
-            .with_context(|| format!("failed to write dump file {}", output.display()))?;
-        written += count;
-        eprintln!("read {written}/{length} bytes");
-    }
-    writer.flush().context("failed to flush dump file")?;
-
-    println!(
-        "dumped {length} bytes from 0x{address:06X} to {}",
-        output.display()
-    );
-    Ok(())
-}
-
-async fn cmd_flash_read(device: &mut Msu2Device, address: u32, length: u32) -> anyhow::Result<()> {
-    device
-        .initialize()
-        .await
-        .context("failed to initialize MSU2")?;
-
-    let mut data = Vec::with_capacity(length as usize);
-    for offset in 0..length {
-        data.push(device.read_flash_byte(address + offset).await?);
-    }
-
-    for (index, chunk) in data.chunks(32).enumerate() {
-        println!(
-            "{:06X}: {}",
-            address as usize + index * 32,
-            hex_bytes(chunk)
-        );
-    }
-    Ok(())
-}
-
-async fn cmd_reset(
-    cli: &Cli,
-    hub: Option<&str>,
-    hub_port: Option<u8>,
-    wait_ms: u64,
-) -> anyhow::Result<()> {
-    let wait = Duration::from_millis(wait_ms);
-
-    // 1. 串口 BREAK：这个固件会把它当作复位信号，且不依赖 VBUS 断电。
-    if let Ok(ports) = msu2_core::list_ports() {
-        if let Some(port) = ports.into_iter().find(|port| port.is_msu2()) {
-            println!("Sending serial BREAK to {}...", port.path);
-            if send_serial_break(&port.path).is_ok() {
-                if let Some(device) = wait_for_msu2(cli, wait).await {
-                    println!(
-                        "reset complete: {} (firmware {})",
-                        device.path(),
-                        device.version_string()
-                    );
-                    return Ok(());
-                }
-            }
-
-            println!("Trying DTR/RTS reset on {}...", port.path);
-            if pulse_control_lines(&port.path, cli.baud).await.is_ok() {
-                if let Some(device) = wait_for_msu2(cli, wait).await {
-                    println!(
-                        "reset complete: {} (firmware {})",
-                        device.path(),
-                        device.version_string()
-                    );
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    // 2. 兜底：通过 hub 端口断电。部分 hub 报告 ppps 但并不会真正切 VBUS。
-    let (hub, hub_port) = match (hub, hub_port) {
-        (Some(hub), Some(port)) => (hub.to_owned(), port),
-        _ => find_msu2_hub_port()?,
-    };
-
-    println!("Power-cycling MSU2 on hub {hub} port {hub_port}...");
-    uhubctl_set(&hub, hub_port, "off")?;
-    tokio::time::sleep(Duration::from_millis(2000)).await;
-
-    let still_present = msu2_core::list_ports()
-        .map(|ports| ports.iter().any(|port| port.is_msu2()))
-        .unwrap_or(false);
-
-    uhubctl_set(&hub, hub_port, "on")?;
-
-    if still_present {
-        eprintln!(
-            "warning: MSU2 still enumerated while hub port {hub_port} was off; \
-             this hub did not actually cut VBUS, so the MCU was not power-cycled."
-        );
-    }
-
-    if let Some(device) = wait_for_msu2(cli, wait).await {
-        println!(
-            "reset complete: {} (firmware {})",
-            device.path(),
-            device.version_string()
-        );
-        return Ok(());
-    }
-
-    bail!(
-        "MSU2 did not recover within {wait_ms} ms. Serial BREAK/DTR/RTS did not reset it, \
-         and the hub port did not really cut VBUS. Use a port that switches VBUS, or \
-         power-cycle the USB cable once."
-    )
-}
-
-fn uhubctl_set(hub: &str, port: u8, action: &str) -> anyhow::Result<()> {
-    let port_arg = port.to_string();
-    let output = ProcessCommand::new("uhubctl")
-        .args(["-S", "-l", hub, "-p", port_arg.as_str(), "-a", action])
-        .output()
-        .context("failed to run uhubctl; install uhubctl or pass --hub/--hub-port")?;
-
-    if !output.status.success() {
-        bail!(
-            "uhubctl failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-async fn wait_for_msu2(cli: &Cli, timeout: Duration) -> Option<Msu2Device> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(ports) = msu2_core::list_ports() {
-            if let Some(port) = ports.into_iter().find(|port| port.is_msu2()) {
-                if let Ok(device) = Msu2Device::connect(
-                    port.path.clone(),
-                    cli.baud,
-                    Duration::from_millis(cli.timeout_ms),
-                )
-                .await
-                {
-                    return Some(device);
-                }
-            }
-        }
-
-        if Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-async fn pulse_control_lines(path: &str, baud: u32) -> anyhow::Result<()> {
-    use tokio_serial::{SerialPort, SerialPortBuilderExt};
-
-    let mut stream = tokio_serial::new(path, baud)
-        .open_native_async()
-        .with_context(|| format!("failed to open {path} for DTR/RTS reset"))?;
-
-    stream.write_data_terminal_ready(false)?;
-    stream.write_request_to_send(false)?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    stream.write_data_terminal_ready(true)?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    stream.write_data_terminal_ready(false)?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    stream.write_data_terminal_ready(true)?;
-    Ok(())
-}
-
-fn find_msu2_hub_port() -> anyhow::Result<(String, u8)> {
-    let output = ProcessCommand::new("uhubctl")
-        .arg("-S")
-        .output()
-        .context("failed to run uhubctl; install uhubctl or pass --hub/--hub-port")?;
-
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-
-    let mut current_hub: Option<String> = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-
-        if let Some(rest) = trimmed.strip_prefix("Current status for hub ") {
-            if let Some(hub) = rest.split_whitespace().next() {
-                current_hub = Some(hub.to_owned());
-            }
-        }
-
-        if trimmed.starts_with("Port ") && trimmed.contains("1a86:fe0c") {
-            let hub = current_hub
-                .clone()
-                .context("found MSU2 port but could not determine its hub")?;
-            let port_str = trimmed
-                .strip_prefix("Port ")
-                .and_then(|rest| rest.split(':').next())
-                .unwrap_or("");
-            let port = port_str
-                .parse::<u8>()
-                .with_context(|| format!("invalid hub port number: {port_str}"))?;
-            return Ok((hub, port));
-        }
-    }
-
-    bail!("MSU2 (1a86:fe0c) not found in uhubctl output; pass --hub and --hub-port")
-}
-
-async fn cmd_raw(cli: &Cli, hex: &str, handshake: bool, delay_ms: u64) -> anyhow::Result<()> {
-    let path = resolve_port(cli)?;
-    let timeout = Duration::from_millis(cli.timeout_ms);
-    let mut device = if handshake {
-        Msu2Device::connect(path.clone(), cli.baud, timeout)
-            .await
-            .with_context(|| format!("failed to connect to {path}"))?
-    } else {
-        Msu2Device::open(path.clone(), cli.baud, timeout)
-            .with_context(|| format!("failed to open {path}"))?
-    };
-
-    let bytes = parse_hex_bytes(hex)?;
-    if delay_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-    }
-    device
-        .send_raw(&bytes)
-        .await
-        .context("failed to write bytes")?;
-    println!("TX: {}", hex_bytes(&bytes));
-
-    let deadline = Instant::now() + Duration::from_millis(cli.timeout_ms);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            println!("RX: <timeout; this command may be write-only>");
-            break;
-        }
-
-        match device.next_frame(remaining).await {
-            Ok(Frame::Heartbeat { .. }) => continue,
-            Ok(frame) => {
-                println!("RX: {frame}");
-                break;
-            }
-            Err(msu2_core::Error::Timeout) => {
-                println!("RX: <timeout; this command may be write-only>");
-                break;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(unix)]
-fn send_serial_break(path: &str) -> anyhow::Result<()> {
-    use std::os::unix::io::AsRawFd;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("failed to open {path} for BREAK"))?;
-
-    let result = unsafe { libc::tcsendbreak(file.as_raw_fd(), 0) };
-    if result != 0 {
-        bail!("tcsendbreak failed: {}", std::io::Error::last_os_error());
-    }
-    std::thread::sleep(Duration::from_millis(500));
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn send_serial_break(_path: &str) -> anyhow::Result<()> {
-    bail!("serial BREAK reset is only implemented on Unix")
-}
-
 fn format_sfr_value(value: &SfrValue) -> String {
     match value {
         SfrValue::U16(value) => format!("{value} (0x{value:04X})"),
@@ -1443,33 +747,6 @@ fn hex_bytes(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn parse_hex_bytes(input: &str) -> anyhow::Result<Vec<u8>> {
-    let cleaned: String = input
-        .chars()
-        .filter(|ch| !ch.is_whitespace() && *ch != '_' && *ch != ':' && *ch != '-')
-        .collect();
-    let cleaned = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-        .unwrap_or(&cleaned);
-
-    if cleaned.is_empty() || !cleaned.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        bail!("invalid hex string");
-    }
-    if cleaned.len() % 2 != 0 {
-        bail!("hex string must contain an even number of digits");
-    }
-
-    let mut bytes = Vec::with_capacity(cleaned.len() / 2);
-    for index in (0..cleaned.len()).step_by(2) {
-        bytes.push(
-            u8::from_str_radix(&cleaned[index..index + 2], 16)
-                .with_context(|| format!("invalid hex byte at offset {index}"))?,
-        );
-    }
-    Ok(bytes)
 }
 
 fn parse_rgb565(input: &str) -> anyhow::Result<u16> {

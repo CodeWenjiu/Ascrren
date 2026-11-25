@@ -1,12 +1,11 @@
 //! 长驻的 Slint → MSU2 实时显示桥。
 //!
 //! Slint 用 `MinimalSoftwareWindow` 软件渲染到 160×80 RGB565 framebuffer，
-//! 每帧与上一帧做 tile 差分，只把变化的矩形通过 USB 发给屏幕。空闲时周期
-//! 读 ADC 保活，避免固件回到出场动画。
+//! 每帧与上一帧做 tile 差分，只把变化的矩形通过 USB 发给屏幕。背面触摸
+//! 焊盘用于翻页，采样顺便充当保活，避免固件回到出场动画。
 //!
 //! ```text
 //! msu2-slint                  # 自动找设备，60 fps，直到 Ctrl-C
-//! msu2-slint --dry-run        # 只渲染并打印差分统计
 //! msu2-slint --fps 30         # 限制帧率
 //! ```
 
@@ -28,6 +27,14 @@ const TILE_SIZE: u16 = 16;
 
 /// 循环展示的页面数。
 const PAGES: usize = 4;
+/// USB CDC 下波特率只是名义值。
+const BAUDRATE: u32 = 19200;
+/// 握手和命令的默认超时。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// 空闲时的采样频率，单位 Hz。
+const IDLE_SAMPLE_HZ: u64 = 15;
+/// 按住或等待恢复时的采样频率，单位 Hz。
+const ACTIVE_SAMPLE_HZ: u64 = 30;
 
 #[derive(Debug, Parser)]
 #[command(name = "msu2-slint", about = "把 Slint 界面实时镜像到 MSU2 副屏")]
@@ -35,14 +42,6 @@ struct Cli {
     /// 串口路径；省略时自动查找 VID:PID 1a86:fe0c
     #[arg(long)]
     port: Option<String>,
-
-    /// 串口波特率（USB CDC 下通常只是名义值）
-    #[arg(long, default_value_t = 19200)]
-    baud: u32,
-
-    /// 握手/命令超时（毫秒）
-    #[arg(long, default_value_t = 8000)]
-    timeout_ms: u64,
 
     /// 目标帧率
     #[arg(long, default_value_t = 60)]
@@ -52,49 +51,9 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     duration_ms: u64,
 
-    /// 只渲染不发送，用于检查 UI 和差分统计
-    #[arg(long)]
-    dry_run: bool,
-
-    /// 每帧打印差分统计
-    #[arg(long)]
-    verbose: bool,
-
-    /// 退出时把最后一帧写成 BMP
-    #[arg(long, value_name = "FILE")]
-    dump_bmp: Option<std::path::PathBuf>,
-
-    /// 每 N 帧采样一次按键；60 fps 下默认为 30 Hz
-    #[arg(long, default_value_t = 2)]
-    sample_divisor: u64,
-
     /// 判定按下的下降幅度（相对基线）；灵敏度不够时调小
-    #[arg(long, default_value_t = 125)]
+    #[arg(long, default_value_t = 150)]
     press_delta: u16,
-
-    /// 中值滤波窗口；1 表示关闭
-    #[arg(long, default_value_t = 3)]
-    median_window: u8,
-
-    /// 释放后多久内忽略新的按下（毫秒），抑制焊盘回弹
-    #[arg(long, default_value_t = 250)]
-    release_lockout_ms: u64,
-
-    /// 释放后需要连续多少次电平恢复才重新允许按下
-    #[arg(long, default_value_t = 3)]
-    rearm_samples: u8,
-
-    /// 跳过校准，直接使用指定基线（调试用）
-    #[arg(long)]
-    baseline: Option<u32>,
-
-    /// 跟踪基线漂移（默认关闭；ADC 噪声会让基线随机游走）
-    #[arg(long)]
-    track_baseline: bool,
-
-    /// 打印每一次按键采样
-    #[arg(long)]
-    trace: bool,
 }
 
 struct HeadlessPlatform {
@@ -123,9 +82,6 @@ struct Stats {
     dirty_tiles: u64,
     rects: u64,
     bytes: u64,
-    samples: u64,
-    sample_total: Duration,
-    sample_max: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,11 +119,7 @@ async fn main() -> anyhow::Result<()> {
     window.set_size(slint::PhysicalSize::new(WIDTH as u32, HEIGHT as u32));
     ui.show().context("failed to show the Slint window")?;
 
-    let mut device = if cli.dry_run {
-        None
-    } else {
-        Some(connect(&cli).await?)
-    };
+    let mut device = connect(&cli).await?;
 
     let grid = TileGrid::new(WIDTH as u16, HEIGHT as u16, TILE_SIZE)
         .context("failed to build the tile grid")?;
@@ -180,16 +132,8 @@ async fn main() -> anyhow::Result<()> {
     let mut button = ButtonState::new(ButtonConfig {
         press_delta: cli.press_delta,
         release_delta: (u32::from(cli.press_delta) * 2 / 3) as u16,
-        median_window: cli.median_window,
-        release_lockout: Duration::from_millis(cli.release_lockout_ms),
-        rearm_samples: cli.rearm_samples,
-        track_baseline: cli.track_baseline,
         ..ButtonConfig::default()
     });
-    if let Some(baseline) = cli.baseline {
-        button.set_baseline(baseline);
-        println!("using manual baseline={baseline}");
-    }
 
     slint::platform::update_timers_and_animations();
     refresh_ui(&ui, &state, &button);
@@ -199,27 +143,24 @@ async fn main() -> anyhow::Result<()> {
     copy_pixels(&pixels, &mut current);
 
     let mut stats = Stats::default();
-    if let Some(device) = device.as_mut() {
-        let bytes = send_full_frame(device, &current).await?;
-        stats.bytes += bytes as u64;
-        stats.sent += 1;
-        println!("initial frame sent ({bytes} B)");
-    } else {
-        println!("dry-run: initial frame rendered");
-    }
+    let bytes = send_full_frame(&mut device, &current).await?;
+    stats.bytes += bytes as u64;
+    stats.sent += 1;
+    println!("initial frame sent ({bytes} B)");
     previous.copy_from_slice(&current);
     stats.rendered += 1;
 
     let interval = Duration::from_micros(1_000_000 / cli.fps.max(1));
+    // 采样频率跟着帧率走，避免降帧后按键变得不灵敏。
+    let idle_divisor = (cli.fps.max(1) / IDLE_SAMPLE_HZ).max(1);
+    let active_divisor = (cli.fps.max(1) / ACTIVE_SAMPLE_HZ).max(1);
     let started = Instant::now();
     let deadline = (cli.duration_ms > 0).then(|| started + Duration::from_millis(cli.duration_ms));
     let mut next_frame = Instant::now() + interval;
     let mut frame_index = 1u64;
-    let mut calibration_announced = cli.baseline.is_some();
+    let mut calibration_announced = false;
 
-    if device.is_some() {
-        println!("calibrating the touch pad; keep hands off the back of the screen");
-    }
+    println!("calibrating the touch pad; keep hands off the back of the screen");
 
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -229,51 +170,28 @@ async fn main() -> anyhow::Result<()> {
         slint::platform::update_timers_and_animations();
 
         // 按键采样就是保活：每次 read_adc 都是一次完整的 USB 往返。
-        if let Some(device) = device.as_mut()
-            && frame_index.is_multiple_of(cli.sample_divisor.max(1))
-        {
+        // 空闲时降低频率，按住或等待电平恢复时恢复高频。
+        let sample_divisor = if button.needs_fast_sampling() {
+            active_divisor
+        } else {
+            idle_divisor
+        };
+        if frame_index.is_multiple_of(sample_divisor) {
             let now = Instant::now();
             let raw = device.read_adc(9).await.context(
                 "device stopped responding; unplug/replug the screen-side USB to recover",
             )?;
-            let sample_cost = now.elapsed();
-            stats.samples += 1;
-            stats.sample_total += sample_cost;
-            stats.sample_max = stats.sample_max.max(sample_cost);
-
-            let press = button.sample(raw, now);
-
-            if cli.trace {
-                println!(
-                    "raw={raw:>5} filtered={:>5} baseline={:>5} press<{:>5} release>{:>5} armed={:<5} pressed={}",
-                    button.last_filtered(),
-                    button.baseline(),
-                    button.press_threshold(),
-                    button.release_threshold(),
-                    button.is_armed(),
-                    button.is_pressed()
-                );
-            }
-
-            if let Some(press) = press {
+            if let Some(press) = button.sample(raw, now) {
                 state.advance();
                 println!(
-                    "press held={}ms page={}",
+                    "press held={}ms page={} raw={raw} baseline={}",
                     press.held.as_millis(),
-                    state.page
+                    state.page,
+                    button.baseline()
                 );
             }
             if !calibration_announced && button.is_calibrated() {
-                println!(
-                    "touch pad calibrated: baseline={} spread={}",
-                    button.baseline(),
-                    button.calibration_spread()
-                );
-                if button.calibration_spread() > 60 {
-                    println!(
-                        "warning: samples were noisy during calibration; restart and keep hands off the back"
-                    );
-                }
+                println!("touch pad calibrated: baseline={}", button.baseline());
                 calibration_announced = true;
             }
         }
@@ -295,25 +213,9 @@ async fn main() -> anyhow::Result<()> {
                 stats.dirty_tiles += dirty.len() as u64;
                 stats.rects += rects.len() as u64;
 
-                if let Some(device) = device.as_mut() {
-                    let bytes = send_tiles(device, &current, &rects).await?;
-                    stats.bytes += bytes as u64;
-                    stats.sent += 1;
-
-                    if cli.verbose {
-                        println!(
-                            "frame={frame_index:>5} dirty_tiles={} rects={} bytes={bytes}",
-                            dirty.len(),
-                            rects.len()
-                        );
-                    }
-                } else if cli.verbose {
-                    println!(
-                        "frame={frame_index:>5} dirty_tiles={} rects={}",
-                        dirty.len(),
-                        rects.len()
-                    );
-                }
+                let bytes = send_tiles(&mut device, &current, &rects).await?;
+                stats.bytes += bytes as u64;
+                stats.sent += 1;
             }
 
             previous.copy_from_slice(&current);
@@ -348,30 +250,15 @@ async fn main() -> anyhow::Result<()> {
         stats.bytes
     );
 
-    if stats.samples > 0 {
-        println!(
-            "sampled {} times, avg {:.1} ms, max {:.1} ms",
-            stats.samples,
-            stats.sample_total.as_secs_f64() * 1000.0 / stats.samples as f64,
-            stats.sample_max.as_secs_f64() * 1000.0
-        );
-    }
-
-    if let Some(path) = &cli.dump_bmp {
-        write_bmp(path, &pixels).context("failed to write BMP")?;
-        println!("frame written to {}", path.display());
-    }
-
     Ok(())
 }
 
 async fn connect(cli: &Cli) -> anyhow::Result<Msu2Device> {
-    let timeout = Duration::from_millis(cli.timeout_ms);
     let mut device = match &cli.port {
-        Some(port) => Msu2Device::connect(port.clone(), cli.baud, timeout)
+        Some(port) => Msu2Device::connect(port.clone(), BAUDRATE, CONNECT_TIMEOUT)
             .await
             .with_context(|| format!("failed to connect to MSU2 on {port}"))?,
-        None => Msu2Device::auto_connect(cli.baud, timeout)
+        None => Msu2Device::auto_connect(BAUDRATE, CONNECT_TIMEOUT)
             .await
             .context("no MSU2 device found; pass --port")?,
     };
@@ -420,45 +307,4 @@ async fn send_tiles(
     })?
     .context("failed to stream tiles")?;
     Ok(bytes)
-}
-
-fn write_bmp(path: &std::path::Path, frame: &[Rgb565Pixel]) -> std::io::Result<()> {
-    let row_stride = (WIDTH * 3).div_ceil(4) * 4;
-    let mut bitmap = vec![0u8; row_stride * HEIGHT];
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            let value = frame[y * WIDTH + x].0;
-            let r = (((value >> 11) & 0x1f) as u32 * 255 / 31) as u8;
-            let g = (((value >> 5) & 0x3f) as u32 * 255 / 63) as u8;
-            let b = ((value & 0x1f) as u32 * 255 / 31) as u8;
-            let offset = (HEIGHT - 1 - y) * row_stride + x * 3;
-            bitmap[offset] = b;
-            bitmap[offset + 1] = g;
-            bitmap[offset + 2] = r;
-        }
-    }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut file = std::fs::File::create(path)?;
-    use std::io::Write;
-    file.write_all(b"BM")?;
-    file.write_all(&(54 + bitmap.len() as u32).to_le_bytes())?;
-    file.write_all(&0u32.to_le_bytes())?;
-    file.write_all(&54u32.to_le_bytes())?;
-    file.write_all(&40u32.to_le_bytes())?;
-    file.write_all(&(WIDTH as i32).to_le_bytes())?;
-    file.write_all(&(HEIGHT as i32).to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&24u16.to_le_bytes())?;
-    file.write_all(&0u32.to_le_bytes())?;
-    file.write_all(&(bitmap.len() as u32).to_le_bytes())?;
-    file.write_all(&2835i32.to_le_bytes())?;
-    file.write_all(&2835i32.to_le_bytes())?;
-    file.write_all(&0u32.to_le_bytes())?;
-    file.write_all(&0u32.to_le_bytes())?;
-    file.write_all(&bitmap)?;
-    Ok(())
 }
