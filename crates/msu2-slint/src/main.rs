@@ -5,9 +5,9 @@
 //! 读 ADC 保活，避免固件回到出场动画。
 //!
 //! ```text
-//! msu2-slint-spike                  # 自动找设备，60 fps，直到 Ctrl-C
-//! msu2-slint-spike --dry-run        # 只渲染并打印差分统计
-//! msu2-slint-spike --fps 30         # 限制帧率
+//! msu2-slint                  # 自动找设备，60 fps，直到 Ctrl-C
+//! msu2-slint --dry-run        # 只渲染并打印差分统计
+//! msu2-slint --fps 30         # 限制帧率
 //! ```
 
 use std::rc::Rc;
@@ -33,7 +33,7 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Parser)]
-#[command(about = "把 Slint 界面实时镜像到 MSU2 副屏")]
+#[command(name = "msu2-slint", about = "把 Slint 界面实时镜像到 MSU2 副屏")]
 struct Cli {
     /// 串口路径；省略时自动查找 VID:PID 1a86:fe0c
     #[arg(long)]

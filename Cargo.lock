@@ -2443,7 +2443,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "msu2-slint-spike"
+name = "msu2-slint"
 version = "0.1.0"
 dependencies = [
  "anyhow",

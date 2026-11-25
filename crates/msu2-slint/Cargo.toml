@@ -1,12 +1,9 @@
 [package]
-name = "msu2-slint-spike"
+name = "msu2-slint"
 version.workspace = true
 edition.workspace = true
 rust-version = "1.95"
-
-[[bin]]
-name = "msu2-slint-spike"
-path = "src/main.rs"
+description = "把 Slint 界面实时镜像到 MSU2 160×80 副屏"
 
 [dependencies]
 msu2-core.workspace = true
