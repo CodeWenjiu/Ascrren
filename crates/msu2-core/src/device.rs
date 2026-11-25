@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::display::encode_rgb565_frame;
 use crate::error::Error;
 use crate::protocol::{self, Frame};
 use crate::sfr::{SfrKind, SfrTable, SfrValue};
@@ -299,6 +300,41 @@ impl<T: Transport> Msu2Device<T> {
             packet.extend_from_slice(&protocol::lcd_flush_chunk(chunk));
             remaining -= u32::from(chunk);
         }
+        self.transport.send(&packet).await
+    }
+
+    /// 将一整帧 RGB565 数据流式发送到屏幕。
+    ///
+    /// 编码遵循厂商 Demo 的实际顺序：每个 256 字节页先发 `02 04`
+    /// 填充字，只对不同的 word 发 `04`，再 flush。实验性路径，
+    /// 仅在厂商支持的窗口尺寸下使用。
+    pub async fn display_frame(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        frame: &[u8],
+    ) -> Result<(), Error> {
+        let packet = encode_rgb565_frame(frame, width, height)?;
+
+        #[cfg(not(test))]
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        self.transport.send(&protocol::lcd_set_xy(x, y)).await?;
+        #[cfg(not(test))]
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        self.transport
+            .send(&protocol::lcd_set_size(width, height))
+            .await?;
+        #[cfg(not(test))]
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        self.transport.send(&protocol::lcd_stream_start()).await?;
+        #[cfg(not(test))]
+        {
+            let _ = self.transport.next_frame(Duration::from_millis(1000)).await;
+        }
+
         self.transport.send(&packet).await
     }
 

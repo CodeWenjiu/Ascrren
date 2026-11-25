@@ -50,7 +50,7 @@ enum Command {
         interval_ms: u64,
     },
 
-    /// 用纯色填充屏幕区域（实验性：V1.0 固件的流式路径会卡死）
+    /// 用纯色填充屏幕区域（使用 02 04 填充字路径）
     Fill {
         #[arg(long, default_value_t = 0)]
         x: u16,
@@ -75,10 +75,33 @@ enum Command {
         /// 发送后保持连接的时长（毫秒）；用于观察画面是否稳定
         #[arg(long, default_value_t = 0)]
         hold_ms: u64,
+    },
 
-        /// 使用固件的 02 04 填充字路径，而不是发送完整像素数据
+    /// 发送原始 RGB565 帧（160×80，小端文件字节序按 RGB565 大端写入）
+    Frame {
+        /// 原始 RGB565 文件，长度必须为 160×80×2 字节
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
+
+        #[arg(long, default_value_t = 0)]
+        x: u16,
+
+        #[arg(long, default_value_t = 0)]
+        y: u16,
+
+        #[arg(long, default_value_t = 160)]
+        width: u16,
+
+        #[arg(long, default_value_t = 80)]
+        height: u16,
+
+        /// 明知流式路径有风险仍要尝试
         #[arg(long)]
-        fill_word: bool,
+        force: bool,
+
+        /// 发送后保持连接的时长（毫秒）
+        #[arg(long, default_value_t = 0)]
+        hold_ms: u64,
     },
 
     /// 显示外部 Flash 中预存的彩色图片
@@ -284,7 +307,6 @@ async fn run() -> anyhow::Result<()> {
             ref color,
             force,
             hold_ms,
-            fill_word,
         } => {
             let mut device = connect(&cli).await?;
             let spec = FillSpec {
@@ -294,7 +316,31 @@ async fn run() -> anyhow::Result<()> {
                 height,
                 color: color.clone(),
             };
-            cmd_fill(&mut device, &spec, force, hold_ms, fill_word).await
+            cmd_fill(&mut device, &spec, force, hold_ms).await
+        }
+        Command::Frame {
+            ref file,
+            x,
+            y,
+            width,
+            height,
+            force,
+            hold_ms,
+        } => {
+            let mut device = connect(&cli).await?;
+            cmd_frame(
+                &mut device,
+                file,
+                FrameSpec {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+                force,
+                hold_ms,
+            )
+            .await
         }
         Command::Photo {
             page,
@@ -523,13 +569,9 @@ async fn cmd_fill(
     spec: &FillSpec,
     force: bool,
     hold_ms: u64,
-    fill_word: bool,
 ) -> anyhow::Result<()> {
     if !force {
-        bail!(
-            "host streaming (fill) is known to hang MSU2 firmware V1.0; \
-             use `photo`, `ascii`, or `gb2312` instead, or pass --force for debugging"
-        );
+        bail!("fill uses the experimental streaming path; pass --force to try it");
     }
     if spec.width == 0 || spec.height == 0 {
         bail!("width and height must be greater than zero");
@@ -548,17 +590,10 @@ async fn cmd_fill(
         .initialize()
         .await
         .context("failed to initialize MSU2")?;
-    if fill_word {
-        device
-            .fill_rect_words(spec.x, spec.y, spec.width, spec.height, rgb565)
-            .await
-            .context("failed to stream fill-word data")?;
-    } else {
-        device
-            .fill_rect(spec.x, spec.y, spec.width, spec.height, rgb565)
-            .await
-            .context("failed to stream fill data")?;
-    }
+    device
+        .fill_rect_words(spec.x, spec.y, spec.width, spec.height, rgb565)
+        .await
+        .context("failed to stream fill-word data")?;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     println!(
@@ -570,28 +605,87 @@ async fn cmd_fill(
         spec.color.trim_start_matches('#').to_uppercase()
     );
 
-    if hold_ms > 0 {
-        let deadline = Instant::now() + Duration::from_millis(hold_ms);
-        let mut failures = 0u32;
-        while Instant::now() < deadline {
-            // 只保活，不重复发送流式数据，避免放大固件风险。
-            match device.read_adc(9).await {
-                Ok(_) => failures = 0,
-                Err(error) => {
-                    failures += 1;
-                    if failures >= 2 {
-                        bail!(
-                            "device stopped responding after streaming ({error}); \
-                             firmware likely hung, unplug/replug USB to recover"
-                        );
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        println!("held session for {hold_ms} ms");
+    hold_session(device, hold_ms).await?;
+    Ok(())
+}
+
+struct FrameSpec {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+async fn cmd_frame(
+    device: &mut Msu2Device,
+    file: &PathBuf,
+    spec: FrameSpec,
+    force: bool,
+    hold_ms: u64,
+) -> anyhow::Result<()> {
+    if !force {
+        bail!("raw framebuffer streaming is experimental; pass --force to try it");
+    }
+    if spec.x.saturating_add(spec.width) > 160 || spec.y.saturating_add(spec.height) > 80 {
+        bail!("frame must fit inside the 160x80 screen");
     }
 
+    let data = std::fs::read(file)
+        .with_context(|| format!("failed to read frame file {}", file.display()))?;
+    let expected = usize::from(spec.width) * usize::from(spec.height) * 2;
+    if data.len() != expected {
+        bail!(
+            "frame file has {} bytes, expected {expected} for {}x{} RGB565",
+            data.len(),
+            spec.width,
+            spec.height
+        );
+    }
+
+    device
+        .initialize()
+        .await
+        .context("failed to initialize MSU2")?;
+    device
+        .display_frame(spec.x, spec.y, spec.width, spec.height, &data)
+        .await
+        .context("failed to stream frame")?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    println!(
+        "sent {}x{} frame from {}",
+        spec.width,
+        spec.height,
+        file.display()
+    );
+    hold_session(device, hold_ms).await?;
+    Ok(())
+}
+
+async fn hold_session(device: &mut Msu2Device, hold_ms: u64) -> anyhow::Result<()> {
+    if hold_ms == 0 {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(hold_ms);
+    let mut failures = 0u32;
+    while Instant::now() < deadline {
+        // 只保活，不重复发送流式数据，避免放大固件风险。
+        match device.read_adc(9).await {
+            Ok(_) => failures = 0,
+            Err(error) => {
+                failures += 1;
+                if failures >= 2 {
+                    bail!(
+                        "device stopped responding after streaming ({error}); \
+                         firmware likely hung, unplug/replug USB to recover"
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    println!("held session for {hold_ms} ms");
     Ok(())
 }
 

@@ -194,10 +194,15 @@ pub fn lcd_stream_start() -> [u8; 6] {
     [CMD_LCD, 0x03, 0x07, 0, 0, 0]
 }
 
-/// 设置 32 位填充字（两个 RGB565 像素）：`02 04 hi lo hi lo`。
+/// 设置 32 位填充字（两个 RGB565 像素）：`02 04 d0 d1 d2 d3`。
+pub fn lcd_set_fill_word(word: [u8; 4]) -> [u8; 6] {
+    [CMD_LCD, 0x04, word[0], word[1], word[2], word[3]]
+}
+
+/// 设置 32 位填充字（两个相同 RGB565 像素）。
 pub fn lcd_set_fill(color: u16) -> [u8; 6] {
     let [hi, lo] = color.to_be_bytes();
-    [CMD_LCD, 0x04, hi, lo, hi, lo]
+    lcd_set_fill_word([hi, lo, hi, lo])
 }
 
 /// 刷出一段流式数据：`02 03 08 size_hi size_lo 00`。
@@ -240,6 +245,10 @@ mod tests {
     #[test]
     fn encodes_fill_word() {
         assert_eq!(lcd_set_fill(0xF800), [0x02, 0x04, 0xF8, 0x00, 0xF8, 0x00]);
+        assert_eq!(
+            lcd_set_fill_word([0x12, 0x34, 0x56, 0x78]),
+            [0x02, 0x04, 0x12, 0x34, 0x56, 0x78]
+        );
         assert_eq!(lcd_flush_chunk(256), [0x02, 0x03, 0x08, 0x01, 0x00, 0x00]);
     }
 }
