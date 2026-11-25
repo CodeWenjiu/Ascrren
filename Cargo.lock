@@ -2446,9 +2446,12 @@ dependencies = [
 name = "msu2-slint-spike"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
  "msu2-core",
  "slint",
  "slint-build",
+ "tokio",
 ]
 
 [[package]]

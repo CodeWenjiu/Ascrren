@@ -1,16 +1,72 @@
+//! 长驻的 Slint → MSU2 实时显示桥。
+//!
+//! Slint 用 `MinimalSoftwareWindow` 软件渲染到 160×80 RGB565 framebuffer，
+//! 每帧与上一帧做 tile 差分，只把变化的矩形通过 USB 发给屏幕。空闲时周期
+//! 读 ADC 保活，避免固件回到出场动画。
+//!
+//! ```text
+//! msu2-slint-spike                  # 自动找设备，60 fps，直到 Ctrl-C
+//! msu2-slint-spike --dry-run        # 只渲染并打印差分统计
+//! msu2-slint-spike --fps 30         # 限制帧率
+//! ```
+
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use msu2_core::display::{TileGrid, encode_tile_stream};
+use anyhow::{Context, anyhow};
+use clap::Parser;
+use msu2_core::Msu2Device;
+use msu2_core::display::{DISPLAY_HEIGHT, DISPLAY_WIDTH, Rect, TileGrid};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 use slint::platform::{Platform, WindowAdapter};
 
 slint::include_modules!();
 
-const WIDTH: usize = 160;
-const HEIGHT: usize = 80;
-const TILE: usize = 16;
-const TICKS: usize = 24;
+const WIDTH: usize = DISPLAY_WIDTH as usize;
+const HEIGHT: usize = DISPLAY_HEIGHT as usize;
+const TILE_SIZE: u16 = 16;
+
+/// 单次写入的最长等待时间；固件卡死时 USB 写会因流控永久阻塞。
+const SEND_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 没有画面更新时，多久发一次读命令保活。
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Parser)]
+#[command(about = "把 Slint 界面实时镜像到 MSU2 副屏")]
+struct Cli {
+    /// 串口路径；省略时自动查找 VID:PID 1a86:fe0c
+    #[arg(long)]
+    port: Option<String>,
+
+    /// 串口波特率（USB CDC 下通常只是名义值）
+    #[arg(long, default_value_t = 19200)]
+    baud: u32,
+
+    /// 握手/命令超时（毫秒）
+    #[arg(long, default_value_t = 8000)]
+    timeout_ms: u64,
+
+    /// 目标帧率
+    #[arg(long, default_value_t = 60)]
+    fps: u64,
+
+    /// 运行时长（毫秒）；0 表示一直运行到 Ctrl-C
+    #[arg(long, default_value_t = 0)]
+    duration_ms: u64,
+
+    /// 只渲染不发送，用于检查 UI 和差分统计
+    #[arg(long)]
+    dry_run: bool,
+
+    /// 每帧打印差分统计
+    #[arg(long)]
+    verbose: bool,
+
+    /// 退出时把最后一帧写成 BMP
+    #[arg(long, value_name = "FILE")]
+    dump_bmp: Option<std::path::PathBuf>,
+}
 
 struct HeadlessPlatform {
     window: Rc<MinimalSoftwareWindow>,
@@ -31,7 +87,19 @@ impl Platform for HeadlessPlatform {
     }
 }
 
-fn main() -> Result<(), slint::PlatformError> {
+#[derive(Default)]
+struct Stats {
+    rendered: u64,
+    sent: u64,
+    dirty_tiles: u64,
+    rects: u64,
+    bytes: u64,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
     let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
     slint::platform::set_platform(Box::new(HeadlessPlatform {
         window: window.clone(),
@@ -39,89 +107,221 @@ fn main() -> Result<(), slint::PlatformError> {
     }))
     .expect("Slint platform was already initialized");
 
-    let ui = AppWindow::new()?;
+    let ui = AppWindow::new().context("failed to build the Slint UI")?;
     window.set_size(slint::PhysicalSize::new(WIDTH as u32, HEIGHT as u32));
-    ui.show()?;
+    ui.show().context("failed to show the Slint window")?;
 
-    let mut frame = vec![Rgb565Pixel(0); WIDTH * HEIGHT];
+    let mut device = if cli.dry_run {
+        None
+    } else {
+        Some(connect(&cli).await?)
+    };
+
+    let grid = TileGrid::new(WIDTH as u16, HEIGHT as u16, TILE_SIZE)
+        .context("failed to build the tile grid")?;
+    let mut pixels = vec![Rgb565Pixel(0); WIDTH * HEIGHT];
+    let mut current = vec![0u16; WIDTH * HEIGHT];
     let mut previous = vec![0u16; WIDTH * HEIGHT];
-    let grid = TileGrid::new(WIDTH as u16, HEIGHT as u16, TILE as u16).expect("valid tile grid");
-    let mut rendered_ticks = 0usize;
-    let mut total_dirty_tiles = 0usize;
-    let mut total_wire_bytes = 0usize;
 
-    for tick in 0..TICKS {
-        ui.set_tick((tick % 100) as i32);
-        if tick % 4 == 0 {
-            ui.set_label(format!("MSU2 tick {tick}").into());
+    // 先渲染并发送一整帧，后续只发差分。
+    slint::platform::update_timers_and_animations();
+    ui.set_tick(0);
+    window.draw_if_needed(|renderer| {
+        renderer.render(&mut pixels, WIDTH);
+    });
+    copy_pixels(&pixels, &mut current);
+
+    let mut stats = Stats::default();
+    if let Some(device) = device.as_mut() {
+        let bytes = send_full_frame(device, &current).await?;
+        stats.bytes += bytes as u64;
+        stats.sent += 1;
+        println!("initial frame sent ({bytes} B)");
+    } else {
+        println!("dry-run: initial frame rendered");
+    }
+    previous.copy_from_slice(&current);
+    stats.rendered += 1;
+
+    let interval = Duration::from_micros(1_000_000 / cli.fps.max(1));
+    let started = Instant::now();
+    let deadline = (cli.duration_ms > 0).then(|| started + Duration::from_millis(cli.duration_ms));
+    let mut next_frame = Instant::now() + interval;
+    let mut last_keepalive = Instant::now();
+    let mut frame_index = 1u64;
+
+    loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
         }
 
         slint::platform::update_timers_and_animations();
+        ui.set_tick((frame_index % 100) as i32);
+        if frame_index.is_multiple_of(30) {
+            ui.set_label(format!("MSU2 {frame_index:>5}").into());
+        }
 
-        let mut region_printed = false;
+        let mut rendered = false;
         window.draw_if_needed(|renderer| {
-            let region = renderer.render(&mut frame, WIDTH);
-            let origin = region.bounding_box_origin();
-            let size = region.bounding_box_size();
-            println!(
-                "tick={tick:02} slint_region=({}, {}) {}x{}",
-                origin.x, origin.y, size.width, size.height
-            );
-            region_printed = true;
+            renderer.render(&mut pixels, WIDTH);
+            rendered = true;
         });
 
-        if !region_printed {
-            println!("tick={tick:02} slint_region=none");
-        } else {
-            rendered_ticks += 1;
-        }
+        if rendered {
+            copy_pixels(&pixels, &mut current);
+            let dirty = grid.diff(&previous, &current).context("tile diff failed")?;
 
-        let current: Vec<u16> = frame.iter().map(|pixel| pixel.0).collect();
-        let changed_pixels = current
-            .iter()
-            .zip(&previous)
-            .filter(|(current, previous)| current != previous)
-            .count();
-        let dirty_tiles = grid.diff(&previous, &current).expect("valid framebuffers");
+            if !dirty.is_empty() {
+                let rects = grid.merge_tiles(&dirty);
+                stats.dirty_tiles += dirty.len() as u64;
+                stats.rects += rects.len() as u64;
 
-        let mut wire_bytes = 0usize;
-        let mut preview = None;
-        for tile in &dirty_tiles {
-            let packet = encode_tile_stream(&current, WIDTH as u16, grid.tile_rect(*tile))
-                .expect("valid tile");
-            wire_bytes += packet.len();
-            if preview.is_none() {
-                preview = Some(packet[..packet.len().min(18)].to_vec());
+                if let Some(device) = device.as_mut() {
+                    let bytes = send_tiles(device, &current, &rects).await?;
+                    stats.bytes += bytes as u64;
+                    stats.sent += 1;
+                    last_keepalive = Instant::now();
+
+                    if cli.verbose {
+                        println!(
+                            "frame={frame_index:>5} dirty_tiles={} rects={} bytes={bytes}",
+                            dirty.len(),
+                            rects.len()
+                        );
+                    }
+                } else if cli.verbose {
+                    println!(
+                        "frame={frame_index:>5} dirty_tiles={} rects={}",
+                        dirty.len(),
+                        rects.len()
+                    );
+                }
             }
+
+            previous.copy_from_slice(&current);
+            stats.rendered += 1;
         }
 
-        let tile_coords: Vec<_> = dirty_tiles.iter().map(|tile| (tile.x, tile.y)).collect();
-        total_dirty_tiles += dirty_tiles.len();
-        total_wire_bytes += wire_bytes;
-        println!(
-            "          changed_pixels={changed_pixels} dirty_tiles={} {:?} wire_bytes={wire_bytes} preview={}",
-            dirty_tiles.len(),
-            tile_coords,
-            preview
-                .as_deref()
-                .map(hex_bytes)
-                .unwrap_or_else(|| "<none>".to_owned())
-        );
+        if let Some(device) = device.as_mut()
+            && last_keepalive.elapsed() >= KEEPALIVE_INTERVAL
+        {
+            device.read_adc(9).await.context(
+                "device stopped responding; unplug/replug the screen-side USB to recover",
+            )?;
+            last_keepalive = Instant::now();
+        }
 
-        previous.copy_from_slice(&current);
-        std::thread::sleep(Duration::from_millis(150));
+        frame_index += 1;
+        next_frame += interval;
+        let now = Instant::now();
+        if next_frame > now {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\ninterrupted");
+                    break;
+                }
+                _ = tokio::time::sleep(next_frame - now) => {}
+            }
+        } else if next_frame + interval < now {
+            // 落后超过一帧就重新对齐，避免补偿性突发。
+            next_frame = now;
+        }
     }
 
+    let elapsed = started.elapsed().as_secs_f64();
     println!(
-        "summary: rendered_ticks={rendered_ticks} total_dirty_tiles={total_dirty_tiles} total_wire_bytes={total_wire_bytes}"
+        "rendered {} frames in {elapsed:.2}s ({:.1} fps), sent {} updates, {} dirty tiles in {} rects, {} bytes",
+        stats.rendered,
+        stats.rendered as f64 / elapsed.max(f64::EPSILON),
+        stats.sent,
+        stats.dirty_tiles,
+        stats.rects,
+        stats.bytes
     );
 
-    let output = std::path::Path::new("target/msu2_dump/slint_frame.bmp");
-    std::fs::create_dir_all(output.parent().expect("output parent"))
-        .expect("failed to create output directory");
-    write_bmp(output, &frame).expect("failed to write BMP");
-    println!("frame written to {}", output.display());
+    if let Some(path) = &cli.dump_bmp {
+        write_bmp(path, &pixels).context("failed to write BMP")?;
+        println!("frame written to {}", path.display());
+    }
+
     Ok(())
+}
+
+async fn connect(cli: &Cli) -> anyhow::Result<Msu2Device> {
+    let path = match &cli.port {
+        Some(port) => port.clone(),
+        None => {
+            msu2_core::find_msu2_port()
+                .context("no MSU2 device found; pass --port")?
+                .path
+        }
+    };
+
+    let mut device = Msu2Device::connect(
+        path.clone(),
+        cli.baud,
+        Duration::from_millis(cli.timeout_ms),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to connect to MSU2 on {path}; check the cable, permissions, \
+                 and whether another program owns the port"
+        )
+    })?;
+    device
+        .initialize()
+        .await
+        .context("failed to initialize MSU2")?;
+    println!("connected to {path}");
+    Ok(device)
+}
+
+fn copy_pixels(pixels: &[Rgb565Pixel], out: &mut [u16]) {
+    for (slot, pixel) in out.iter_mut().zip(pixels) {
+        *slot = pixel.0;
+    }
+}
+
+async fn send_full_frame(device: &mut Msu2Device, frame: &[u16]) -> anyhow::Result<usize> {
+    let bytes = rgb565_bytes(frame);
+    let len = bytes.len();
+    tokio::time::timeout(
+        SEND_TIMEOUT,
+        device.display_frame(0, 0, WIDTH as u16, HEIGHT as u16, &bytes),
+    )
+    .await
+    .map_err(|_| anyhow!("initial frame write timed out"))?
+    .context("failed to stream the initial frame")?;
+    Ok(len)
+}
+
+async fn send_tiles(
+    device: &mut Msu2Device,
+    frame: &[u16],
+    rects: &[Rect],
+) -> anyhow::Result<usize> {
+    let bytes = tokio::time::timeout(
+        SEND_TIMEOUT,
+        device.stream_tiles(frame, WIDTH as u16, rects),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "tile write timed out after {SEND_TIMEOUT:?}; firmware likely hung, \
+             unplug/replug the screen-side USB"
+        )
+    })?
+    .context("failed to stream tiles")?;
+    Ok(bytes)
+}
+
+fn rgb565_bytes(frame: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(frame.len() * 2);
+    for pixel in frame {
+        bytes.extend_from_slice(&pixel.to_be_bytes());
+    }
+    bytes
 }
 
 fn write_bmp(path: &std::path::Path, frame: &[Rgb565Pixel]) -> std::io::Result<()> {
@@ -138,6 +338,10 @@ fn write_bmp(path: &std::path::Path, frame: &[Rgb565Pixel]) -> std::io::Result<(
             bitmap[offset + 1] = g;
             bitmap[offset + 2] = r;
         }
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
 
     let mut file = std::fs::File::create(path)?;
@@ -159,12 +363,4 @@ fn write_bmp(path: &std::path::Path, frame: &[Rgb565Pixel]) -> std::io::Result<(
     file.write_all(&0u32.to_le_bytes())?;
     file.write_all(&bitmap)?;
     Ok(())
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }

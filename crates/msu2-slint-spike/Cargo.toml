@@ -11,6 +11,9 @@ path = "src/main.rs"
 [dependencies]
 msu2-core.workspace = true
 slint.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
 
 [build-dependencies]
 slint-build = "1.19"
