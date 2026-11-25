@@ -42,6 +42,12 @@ pub struct ButtonConfig {
     ///
     /// 电容焊盘松手后会在阈值上方反弹，不加锁定会连续触发点击。
     pub release_lockout: Duration,
+    /// 释放后需要连续多少次「安静」采样才重新允许按下。
+    ///
+    /// 比时间锁定更可靠：即使电平长时间停在低位，也不会重复触发。
+    pub rearm_samples: u8,
+    /// 判定为安静的电平幅度：值恢复到 `baseline - rearm_delta` 以上。
+    pub rearm_delta: u16,
     /// 是否在空闲时跟踪基线漂移。
     ///
     /// 默认关闭——ADC 噪声会让 EMA 随机游走，反而使阈值漂移。
@@ -60,6 +66,8 @@ impl Default for ButtonConfig {
             release_debounce_samples: 2,
             median_window: 3,
             release_lockout: Duration::from_millis(250),
+            rearm_samples: 3,
+            rearm_delta: 40,
             track_baseline: false,
             baseline_ema_shift: 6,
         }
@@ -97,6 +105,8 @@ pub struct ButtonState {
     candidate_samples: u8,
     candidate_since: Option<Instant>,
     last_release: Option<Instant>,
+    armed: bool,
+    rearm_quiet: u8,
 }
 
 impl ButtonState {
@@ -114,6 +124,8 @@ impl ButtonState {
             candidate_samples: 0,
             candidate_since: None,
             last_release: None,
+            armed: true,
+            rearm_quiet: 0,
         }
     }
 
@@ -140,6 +152,27 @@ impl ButtonState {
     /// 当前是否处于按下状态。
     pub fn is_pressed(&self) -> bool {
         matches!(self.phase, Phase::Pressed { .. })
+    }
+
+    /// 低于这个值判定为按下。
+    pub fn press_threshold(&self) -> u32 {
+        self.config.press_threshold(self.baseline)
+    }
+
+    /// 高于这个值判定为释放。
+    pub fn release_threshold(&self) -> u32 {
+        self.config.release_threshold(self.baseline)
+    }
+
+    /// 是否允许新的按下。
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// 跳过校准，直接使用指定基线（调试用）。
+    pub fn set_baseline(&mut self, baseline: u32) {
+        self.baseline = baseline;
+        self.phase = Phase::Idle;
     }
 
     /// 输入一次采样，在释放时返回这次按压。
@@ -178,10 +211,26 @@ impl ButtonState {
         }
 
         let baseline = self.baseline;
+
+        // 重新武装：必须先看到电平回到安静区间并保持若干次，才接受
+        // 下一次按下。这样即使松手后电平停在低位，也不会重复触发。
+        if !self.armed {
+            let quiet_level = baseline.saturating_sub(u32::from(self.config.rearm_delta));
+            if u32::from(raw) >= quiet_level {
+                self.rearm_quiet = self.rearm_quiet.saturating_add(1);
+                if self.rearm_quiet >= self.config.rearm_samples.max(1) {
+                    self.armed = true;
+                    self.rearm_quiet = 0;
+                }
+            } else {
+                self.rearm_quiet = 0;
+            }
+        }
+
         let locked = self.last_release.is_some_and(|released| {
             now.saturating_duration_since(released) < self.config.release_lockout
         });
-        let raw_pressed = if locked {
+        let raw_pressed = if !self.armed || locked {
             false
         } else {
             match self.phase {
@@ -218,6 +267,8 @@ impl ButtonState {
                     self.phase = Phase::Idle;
                     self.candidate_samples = 0;
                     self.last_release = Some(now);
+                    self.armed = false;
+                    self.rearm_quiet = 0;
                     return Some(Press {
                         held: now.saturating_duration_since(since),
                     });
@@ -343,6 +394,44 @@ mod tests {
             assert_eq!(state.sample(800, at(start, offset)), None);
         }
         assert!(!state.is_pressed());
+    }
+
+    #[test]
+    fn stays_disarmed_while_the_level_remains_low() {
+        let (mut state, start) = calibrated();
+
+        state.sample(800, start);
+        state.sample(800, at(start, 10));
+        state.sample(1000, at(start, 20));
+        assert!(state.sample(1000, at(start, 30)).is_some());
+        assert!(!state.is_armed());
+
+        // 电平一直停在低位：不应再触发任何按压。
+        for index in 0..60u64 {
+            assert_eq!(state.sample(700, at(start, 100 + index * 10)), None);
+        }
+        assert!(!state.is_pressed());
+        assert!(!state.is_armed());
+    }
+
+    #[test]
+    fn rearms_after_the_level_recovers() {
+        let (mut state, start) = calibrated();
+
+        state.sample(800, start);
+        state.sample(800, at(start, 10));
+        state.sample(1000, at(start, 20));
+        assert!(state.sample(1000, at(start, 30)).is_some());
+
+        // 安静区间是 baseline - 40 = 980，回到 1015 并保持 3 次。
+        state.sample(1015, at(start, 400));
+        state.sample(1015, at(start, 410));
+        state.sample(1015, at(start, 420));
+        assert!(state.is_armed());
+
+        state.sample(800, at(start, 430));
+        state.sample(800, at(start, 440));
+        assert!(state.is_pressed());
     }
 
     #[test]

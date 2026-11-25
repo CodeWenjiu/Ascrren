@@ -80,6 +80,14 @@ struct Cli {
     #[arg(long, default_value_t = 250)]
     release_lockout_ms: u64,
 
+    /// 释放后需要连续多少次电平恢复才重新允许按下
+    #[arg(long, default_value_t = 3)]
+    rearm_samples: u8,
+
+    /// 跳过校准，直接使用指定基线（调试用）
+    #[arg(long)]
+    baseline: Option<u32>,
+
     /// 跟踪基线漂移（默认关闭；ADC 噪声会让基线随机游走）
     #[arg(long)]
     track_baseline: bool,
@@ -174,9 +182,14 @@ async fn main() -> anyhow::Result<()> {
         release_delta: (u32::from(cli.press_delta) * 2 / 3) as u16,
         median_window: cli.median_window,
         release_lockout: Duration::from_millis(cli.release_lockout_ms),
+        rearm_samples: cli.rearm_samples,
         track_baseline: cli.track_baseline,
         ..ButtonConfig::default()
     });
+    if let Some(baseline) = cli.baseline {
+        button.set_baseline(baseline);
+        println!("using manual baseline={baseline}");
+    }
 
     slint::platform::update_timers_and_animations();
     refresh_ui(&ui, &state, &button);
@@ -202,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
     let deadline = (cli.duration_ms > 0).then(|| started + Duration::from_millis(cli.duration_ms));
     let mut next_frame = Instant::now() + interval;
     let mut frame_index = 1u64;
-    let mut calibration_announced = false;
+    let mut calibration_announced = cli.baseline.is_some();
 
     if device.is_some() {
         println!("calibrating the touch pad; keep hands off the back of the screen");
@@ -232,9 +245,12 @@ async fn main() -> anyhow::Result<()> {
 
             if cli.trace {
                 println!(
-                    "raw={raw:>5} filtered={:>5} baseline={:>5} pressed={:<5}",
+                    "raw={raw:>5} filtered={:>5} baseline={:>5} press<{:>5} release>{:>5} armed={:<5} pressed={}",
                     button.last_filtered(),
                     button.baseline(),
+                    button.press_threshold(),
+                    button.release_threshold(),
+                    button.is_armed(),
                     button.is_pressed()
                 );
             }
