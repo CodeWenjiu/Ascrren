@@ -34,9 +34,17 @@ pub struct ButtonConfig {
     pub very_long_press: Duration,
     /// 校准所需的采样数。
     pub calibration_samples: u8,
-    /// 连续多少次一致的采样才切换按下/释放状态。
+    /// 确认按下所需的连续采样数。
     pub debounce_samples: u8,
-    /// 空闲时基线跟踪的 EMA 位移；越大跟踪越慢。
+    /// 确认释放所需的连续采样数。
+    ///
+    /// 比按下更小是故意的：释放判定晚一个采样就可能把点击误算成长按。
+    pub release_debounce_samples: u8,
+    /// 是否在空闲时跟踪基线漂移。
+    ///
+    /// 默认关闭——ADC 噪声会让 EMA 随机游走，反而使阈值漂移。
+    pub track_baseline: bool,
+    /// 基线跟踪的 EMA 位移；越大跟踪越慢。
     pub baseline_ema_shift: u8,
 }
 
@@ -45,11 +53,13 @@ impl Default for ButtonConfig {
         Self {
             press_delta: 125,
             release_delta: 80,
-            long_press: Duration::from_millis(350),
-            very_long_press: Duration::from_millis(1200),
+            long_press: Duration::from_millis(600),
+            very_long_press: Duration::from_millis(1500),
             calibration_samples: 8,
             debounce_samples: 2,
-            baseline_ema_shift: 4,
+            release_debounce_samples: 1,
+            track_baseline: false,
+            baseline_ema_shift: 6,
         }
     }
 }
@@ -86,6 +96,7 @@ pub struct ButtonState {
     baseline: u32,
     candidate: Option<bool>,
     candidate_samples: u8,
+    candidate_since: Option<Instant>,
 }
 
 impl ButtonState {
@@ -97,6 +108,7 @@ impl ButtonState {
             baseline: 0,
             candidate: None,
             candidate_samples: 0,
+            candidate_since: None,
         }
     }
 
@@ -138,12 +150,11 @@ impl ButtonState {
             return None;
         }
 
-        // 空闲且接近基线时缓慢跟踪温漂；按下期间冻结基线，避免把按压
-        // 本身当成漂移吸收掉。窗口只取按下阈值的一半，防止“半按压”被
-        // 当作漂移慢慢吃掉。
-        if matches!(self.phase, Phase::Idle) {
+        // 空闲且开启跟踪时缓慢修正温漂；按下期间冻结基线，避免把按压
+        // 本身当成漂移吸收掉。默认关闭，因为 ADC 噪声会让 EMA 随机游走。
+        if self.config.track_baseline && matches!(self.phase, Phase::Idle) {
             let target = u32::from(raw);
-            let window = u32::from(self.config.press_delta / 2);
+            let window = u32::from(self.config.press_delta / 4);
             let diff = target.abs_diff(self.baseline);
             if diff > 0 && diff <= window {
                 let shift = u32::from(self.config.baseline_ema_shift.clamp(1, 16));
@@ -168,13 +179,23 @@ impl ButtonState {
         } else {
             self.candidate = Some(raw_pressed);
             self.candidate_samples = 1;
+            self.candidate_since = Some(now);
         }
 
-        if self.candidate_samples >= self.config.debounce_samples.max(1) {
+        let needed = if raw_pressed {
+            self.config.debounce_samples
+        } else {
+            self.config.release_debounce_samples
+        }
+        .max(1);
+
+        if self.candidate_samples >= needed {
             match (self.phase, raw_pressed) {
                 (Phase::Idle, true) => {
+                    // 从第一次疑似按下的采样开始计时，避免去抖延迟把
+                    // 一次轻点算成长按。
                     self.phase = Phase::Pressed {
-                        since: now,
+                        since: self.candidate_since.unwrap_or(now),
                         long_fired: false,
                         very_long_fired: false,
                     };
@@ -221,6 +242,7 @@ mod tests {
         ButtonConfig {
             calibration_samples: 4,
             debounce_samples: 2,
+            release_debounce_samples: 1,
             long_press: Duration::from_millis(300),
             very_long_press: Duration::from_millis(900),
             ..ButtonConfig::default()
@@ -231,14 +253,18 @@ mod tests {
         start + Duration::from_millis(ms)
     }
 
-    fn calibrated() -> (ButtonState, Instant) {
-        let mut state = ButtonState::new(config());
+    fn calibrated_with(config: ButtonConfig) -> (ButtonState, Instant) {
+        let mut state = ButtonState::new(config);
         let start = Instant::now();
         for sample in [1000, 1020, 980, 1100] {
             assert_eq!(state.sample(sample, start), None);
         }
         assert!(state.is_calibrated());
         (state, at(start, 10))
+    }
+
+    fn calibrated() -> (ButtonState, Instant) {
+        calibrated_with(config())
     }
 
     #[test]
@@ -256,8 +282,8 @@ mod tests {
         assert_eq!(state.sample(800, at(start, 10)), None);
         assert!(state.is_pressed());
 
-        assert_eq!(state.sample(1000, at(start, 100)), None);
-        assert_eq!(state.sample(1000, at(start, 110)), Some(Gesture::Click));
+        // 释放只需一次采样。
+        assert_eq!(state.sample(1000, at(start, 100)), Some(Gesture::Click));
         assert!(!state.is_pressed());
     }
 
@@ -272,8 +298,18 @@ mod tests {
         assert_eq!(state.sample(800, at(start, 400)), None);
 
         // 长按后的释放不再产生 Click。
-        state.sample(1000, at(start, 500));
-        assert_eq!(state.sample(1000, at(start, 510)), None);
+        assert_eq!(state.sample(1000, at(start, 500)), None);
+    }
+
+    #[test]
+    fn hold_time_starts_at_the_first_press_sample() {
+        let (mut state, start) = calibrated();
+        // 首次疑似按下就应当开始计时，而不是等去抖确认之后。
+        state.sample(800, start);
+        state.sample(800, at(start, 20));
+
+        // 从 start 算起已经 310 ms，达到长按阈值。
+        assert_eq!(state.sample(800, at(start, 310)), Some(Gesture::LongPress));
     }
 
     #[test]
@@ -313,13 +349,27 @@ mod tests {
         assert!(state.is_pressed());
 
         state.sample(960, at(start, 200));
-        state.sample(960, at(start, 210));
         assert!(!state.is_pressed());
     }
 
     #[test]
-    fn tracks_slow_baseline_drift() {
+    fn does_not_track_baseline_by_default() {
         let (mut state, start) = calibrated();
+        let before = state.baseline();
+
+        for index in 0..64u64 {
+            state.sample(1030, at(start, index * 10));
+        }
+
+        assert_eq!(state.baseline(), before);
+    }
+
+    #[test]
+    fn tracks_slow_baseline_drift_when_enabled() {
+        let (mut state, start) = calibrated_with(ButtonConfig {
+            track_baseline: true,
+            ..config()
+        });
         let before = state.baseline();
 
         for index in 0..64u64 {

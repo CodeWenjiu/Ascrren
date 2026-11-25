@@ -73,12 +73,20 @@ struct Cli {
     press_delta: u16,
 
     /// 长按阈值（毫秒）
-    #[arg(long, default_value_t = 350)]
+    #[arg(long, default_value_t = 600)]
     long_ms: u64,
 
     /// 超长按阈值（毫秒）
-    #[arg(long, default_value_t = 1200)]
+    #[arg(long, default_value_t = 1500)]
     very_long_ms: u64,
+
+    /// 跟踪基线漂移（默认关闭；ADC 噪声会让基线随机游走）
+    #[arg(long)]
+    track_baseline: bool,
+
+    /// 打印每一次按键采样
+    #[arg(long)]
+    trace: bool,
 }
 
 struct HeadlessPlatform {
@@ -107,6 +115,9 @@ struct Stats {
     dirty_tiles: u64,
     rects: u64,
     bytes: u64,
+    samples: u64,
+    sample_total: Duration,
+    sample_max: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         release_delta: (u32::from(cli.press_delta) * 2 / 3) as u16,
         long_press: Duration::from_millis(cli.long_ms),
         very_long_press: Duration::from_millis(cli.very_long_ms),
+        track_baseline: cli.track_baseline,
         ..ButtonConfig::default()
     });
 
@@ -237,6 +249,20 @@ async fn main() -> anyhow::Result<()> {
             let raw = device.read_adc(9).await.context(
                 "device stopped responding; unplug/replug the screen-side USB to recover",
             )?;
+            let sample_cost = now.elapsed();
+            stats.samples += 1;
+            stats.sample_total += sample_cost;
+            stats.sample_max = stats.sample_max.max(sample_cost);
+
+            if cli.trace {
+                println!(
+                    "raw={raw:>5} baseline={:>5} pressed={:<5} progress={:.2}",
+                    button.baseline(),
+                    button.is_pressed(),
+                    button.hold_progress(now)
+                );
+            }
+
             if let Some(gesture) = button.sample(raw, now) {
                 println!(
                     "gesture={gesture:?} raw={raw} baseline={} pressed={}",
@@ -320,6 +346,15 @@ async fn main() -> anyhow::Result<()> {
         stats.rects,
         stats.bytes
     );
+
+    if stats.samples > 0 {
+        println!(
+            "sampled {} times, avg {:.1} ms, max {:.1} ms",
+            stats.samples,
+            stats.sample_total.as_secs_f64() * 1000.0 / stats.samples as f64,
+            stats.sample_max.as_secs_f64() * 1000.0
+        );
+    }
 
     if let Some(path) = &cli.dump_bmp {
         write_bmp(path, &pixels).context("failed to write BMP")?;
