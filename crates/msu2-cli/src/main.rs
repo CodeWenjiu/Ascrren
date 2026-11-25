@@ -75,6 +75,10 @@ enum Command {
         /// 发送后保持连接的时长（毫秒）；用于观察画面是否稳定
         #[arg(long, default_value_t = 0)]
         hold_ms: u64,
+
+        /// 使用固件的 02 04 填充字路径，而不是发送完整像素数据
+        #[arg(long)]
+        fill_word: bool,
     },
 
     /// 显示外部 Flash 中预存的彩色图片
@@ -280,6 +284,7 @@ async fn run() -> anyhow::Result<()> {
             ref color,
             force,
             hold_ms,
+            fill_word,
         } => {
             let mut device = connect(&cli).await?;
             let spec = FillSpec {
@@ -289,7 +294,7 @@ async fn run() -> anyhow::Result<()> {
                 height,
                 color: color.clone(),
             };
-            cmd_fill(&mut device, &spec, force, hold_ms).await
+            cmd_fill(&mut device, &spec, force, hold_ms, fill_word).await
         }
         Command::Photo {
             page,
@@ -518,6 +523,7 @@ async fn cmd_fill(
     spec: &FillSpec,
     force: bool,
     hold_ms: u64,
+    fill_word: bool,
 ) -> anyhow::Result<()> {
     if !force {
         bail!(
@@ -542,10 +548,17 @@ async fn cmd_fill(
         .initialize()
         .await
         .context("failed to initialize MSU2")?;
-    device
-        .fill_rect(spec.x, spec.y, spec.width, spec.height, rgb565)
-        .await
-        .context("failed to stream fill data")?;
+    if fill_word {
+        device
+            .fill_rect_words(spec.x, spec.y, spec.width, spec.height, rgb565)
+            .await
+            .context("failed to stream fill-word data")?;
+    } else {
+        device
+            .fill_rect(spec.x, spec.y, spec.width, spec.height, rgb565)
+            .await
+            .context("failed to stream fill data")?;
+    }
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     println!(

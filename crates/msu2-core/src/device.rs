@@ -257,6 +257,51 @@ impl<T: Transport> Msu2Device<T> {
         self.transport.send(&packet).await
     }
 
+    /// 用固件的 `02 04` 填充字路径填充矩形。
+    ///
+    /// 这是厂商 Demo `Write_LCD_Screen_fast` 使用的优化路径：每个 256 字节
+    /// 块只发送一个 4 字节填充字，不发送 64 个数据帧。仍然属于实验性
+    /// streaming 路径。
+    pub async fn fill_rect_words(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        color: u16,
+    ) -> Result<(), Error> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        #[cfg(not(test))]
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        self.transport.send(&protocol::lcd_set_xy(x, y)).await?;
+        #[cfg(not(test))]
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        self.transport
+            .send(&protocol::lcd_set_size(width, height))
+            .await?;
+        #[cfg(not(test))]
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        self.transport.send(&protocol::lcd_stream_start()).await?;
+        #[cfg(not(test))]
+        {
+            let _ = self.transport.next_frame(Duration::from_millis(1000)).await;
+        }
+
+        let mut packet = Vec::new();
+        let mut remaining = u32::from(width) * u32::from(height) * 2;
+        while remaining > 0 {
+            let chunk = remaining.min(256) as u16;
+            packet.extend_from_slice(&protocol::lcd_set_fill(color));
+            packet.extend_from_slice(&protocol::lcd_flush_chunk(chunk));
+            remaining -= u32::from(chunk);
+        }
+        self.transport.send(&packet).await
+    }
+
     /// 显示外部 Flash 中预存的彩色图片。
     pub async fn display_flash_image(
         &mut self,
@@ -412,6 +457,21 @@ mod tests {
         assert_eq!(
             device.transport.sent,
             vec![protocol::sfr_read_u8(0x0100).to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_rect_words_uses_fill_word_frames() {
+        let mut device = mock_device([]);
+        device.fill_rect_words(0, 0, 2, 1, 0xF800).await.unwrap();
+
+        assert_eq!(device.transport.sent.len(), 4);
+        assert_eq!(device.transport.sent[0], protocol::lcd_set_xy(0, 0));
+        assert_eq!(device.transport.sent[1], protocol::lcd_set_size(2, 1));
+        assert_eq!(device.transport.sent[2], protocol::lcd_stream_start());
+        assert_eq!(
+            device.transport.sent[3],
+            [protocol::lcd_set_fill(0xF800), protocol::lcd_flush_chunk(4)].concat()
         );
     }
 
