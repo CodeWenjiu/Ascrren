@@ -58,10 +58,10 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         y: u16,
 
-        #[arg(long, default_value_t = 240)]
+        #[arg(long, default_value_t = 160)]
         width: u16,
 
-        #[arg(long, default_value_t = 240)]
+        #[arg(long, default_value_t = 80)]
         height: u16,
 
         /// RRGGBB，例如 FF0000
@@ -85,10 +85,10 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         y: u16,
 
-        #[arg(long, default_value_t = 240)]
+        #[arg(long, default_value_t = 160)]
         width: u16,
 
-        #[arg(long, default_value_t = 240)]
+        #[arg(long, default_value_t = 80)]
         height: u16,
     },
 
@@ -163,7 +163,7 @@ enum Command {
         font_page: u16,
 
         /// 字符间距
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 0)]
         spacing: u16,
 
         /// 行高
@@ -516,8 +516,8 @@ async fn cmd_fill(
             "width and height must be at least 16; tiny windows hit a firmware LCD/DMA edge case"
         );
     }
-    if x.saturating_add(width) > 240 || y.saturating_add(height) > 240 {
-        bail!("rectangle must fit inside the 240x240 screen");
+    if x.saturating_add(width) > 160 || y.saturating_add(height) > 80 {
+        bail!("rectangle must fit inside the 160x80 screen");
     }
 
     let rgb565 = parse_rgb565(color)?;
@@ -551,6 +551,13 @@ async fn cmd_photo(
     width: u16,
     height: u16,
 ) -> anyhow::Result<()> {
+    if width == 0 || height == 0 {
+        bail!("width and height must be greater than zero");
+    }
+    if x.saturating_add(width) > 160 || y.saturating_add(height) > 80 {
+        bail!("image must fit inside the 160x80 screen");
+    }
+
     device
         .initialize()
         .await
@@ -635,8 +642,8 @@ async fn cmd_clear(device: &mut Msu2Device, bg: &str, font_page: u16) -> anyhow:
         .await
         .context("failed to initialize MSU2")?;
 
-    for y in (0..240).step_by(64) {
-        for x in (0..240).step_by(32) {
+    for y in (0..80).step_by(64) {
+        for x in (0..160).step_by(32) {
             device
                 .display_ascii(x, y, b' ', 0, color, font_page)
                 .await
@@ -715,7 +722,7 @@ async fn draw_text(device: &mut Msu2Device, text: &str, style: TextStyle) -> any
             bail!("only ASCII text is supported by the built-in 32x64 font");
         }
 
-        if cursor_x.saturating_add(glyph_width) > 240 {
+        if cursor_x.saturating_add(glyph_width) > 160 {
             cursor_x = style.x;
             cursor_y = cursor_y.saturating_add(style.line_height);
         }
