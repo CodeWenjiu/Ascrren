@@ -12,6 +12,8 @@ tokio.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 clap.workspace = true
+chrono.workspace = true
+course-signin.workspace = true
 
 [build-dependencies]
 slint-build = "1.19"

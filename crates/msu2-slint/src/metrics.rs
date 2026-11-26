@@ -11,9 +11,7 @@ pub(crate) struct Metrics {
     pub(crate) time: String,
     pub(crate) date: String,
     pub(crate) cpu_percent: u8,
-    pub(crate) cpu_detail: String,
     pub(crate) mem_percent: u8,
-    pub(crate) mem_detail: String,
     pub(crate) net_down: String,
     pub(crate) net_up: String,
     previous_cpu: Option<CpuTimes>,
@@ -47,15 +45,9 @@ impl Metrics {
             }
             self.previous_cpu = Some(cpu);
         }
-        self.cpu_detail = read_load_average();
 
         if let Some((used, total)) = read_memory() {
             self.mem_percent = ((used * 100) / total.max(1)).min(100) as u8;
-            self.mem_detail = format!(
-                "{:.1} / {:.1} GB",
-                used as f64 / 1024.0 / 1024.0,
-                total as f64 / 1024.0 / 1024.0
-            );
         }
 
         let now = Instant::now();
@@ -95,14 +87,6 @@ fn read_cpu() -> Option<CpuTimes> {
     let idle = values[3] + values.get(4).copied().unwrap_or(0);
     let total = values.iter().sum();
     Some(CpuTimes { idle, total })
-}
-
-fn read_load_average() -> String {
-    std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .and_then(|text| text.split_whitespace().next().map(str::to_owned))
-        .map(|load| format!("load {load}"))
-        .unwrap_or_default()
 }
 
 fn read_memory() -> Option<(u64, u64)> {

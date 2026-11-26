@@ -19,9 +19,10 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 
 mod app;
 mod metrics;
+mod signin;
 mod usb;
 
-use app::{AppState, Stats, refresh_metrics, refresh_page};
+use app::{AppState, Stats, refresh_metrics, refresh_page, refresh_text};
 use metrics::Metrics;
 use usb::{connect, copy_pixels, send_full_frame, send_tiles};
 
@@ -31,8 +32,6 @@ pub(crate) const WIDTH: usize = DISPLAY_WIDTH as usize;
 pub(crate) const HEIGHT: usize = DISPLAY_HEIGHT as usize;
 pub(crate) const TILE_SIZE: u16 = 16;
 
-/// 循环展示的页面数。
-pub(crate) const PAGES: usize = 4;
 /// USB CDC 下波特率只是名义值。
 pub(crate) const BAUDRATE: u32 = 19200;
 /// 握手和命令的默认超时。
@@ -62,6 +61,14 @@ pub(crate) struct Cli {
     /// 判定按下的下降幅度（相对基线）；灵敏度不够时调小
     #[arg(long, default_value_t = 150)]
     pub(crate) press_delta: u16,
+
+    /// UCAS 学号；提供后启用签到页
+    #[arg(long)]
+    pub(crate) ucas_user: Option<String>,
+
+    /// UCAS 密码；省略时使用默认初始密码
+    #[arg(long)]
+    pub(crate) ucas_password: Option<String>,
 }
 
 #[tokio::main]
@@ -83,8 +90,29 @@ async fn main() -> anyhow::Result<()> {
     let mut current = vec![0u16; WIDTH * HEIGHT];
     let mut previous = vec![0u16; WIDTH * HEIGHT];
 
-    // 先渲染并发送一整帧，后续只发差分。
+    // 只给学号时使用上游默认初始密码（未改过密码的账号通用）。
+    let mut signin_rx = match &cli.ucas_user {
+        Some(user) => {
+            let password = cli
+                .ucas_password
+                .clone()
+                .unwrap_or_else(|| course_signin::config::DEFAULT_PASSWORD.to_owned());
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            signin::spawn(user.clone(), password, tx);
+            println!("sign-in enabled for {user}");
+            Some(rx)
+        }
+        None => {
+            if cli.ucas_password.is_some() {
+                anyhow::bail!("--ucas-password 需要配合 --ucas-user 使用");
+            }
+            None
+        }
+    };
+    let mut signin_snapshot: Option<signin::Snapshot> = None;
+
     let mut state = AppState::new();
+    state.rebuild(signin_rx.as_ref().map(|_| 0));
     let button_config = ButtonConfig {
         press_delta: cli.press_delta,
         release_delta: (u32::from(cli.press_delta) * 2 / 3) as u16,
@@ -96,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
     slint::platform::update_timers_and_animations();
     refresh_page(&ui, &state, &button);
     refresh_metrics(&ui, &metrics);
+    refresh_text(&ui, &state, signin_snapshot.as_ref());
     window.draw_if_needed(|renderer| {
         renderer.render(&mut pixels, WIDTH);
     });
@@ -129,11 +158,32 @@ async fn main() -> anyhow::Result<()> {
 
         slint::platform::update_timers_and_animations();
 
-        // 每秒刷新一次时间/负载/速率。
+        // 每秒刷新一次时间/负载/速率和文本页。
         if Instant::now() >= next_metrics {
             metrics.refresh();
             refresh_metrics(&ui, &metrics);
+            refresh_text(&ui, &state, signin_snapshot.as_ref());
             next_metrics += METRICS_INTERVAL;
+        }
+
+        // 接收后台签到任务的快照；页数随课程数变化。
+        if let Some(rx) = signin_rx.as_mut() {
+            while let Ok(snapshot) = rx.try_recv() {
+                println!(
+                    "signin: {} courses{}",
+                    snapshot.courses.len(),
+                    snapshot
+                        .error
+                        .as_deref()
+                        .map(|error| format!(", error: {error}"))
+                        .unwrap_or_default()
+                );
+                let count = snapshot.courses.len();
+                signin_snapshot = Some(snapshot);
+                state.rebuild(Some(count));
+                refresh_page(&ui, &state, &button);
+                refresh_text(&ui, &state, signin_snapshot.as_ref());
+            }
         }
 
         // 按键采样就是保活：每次 read_adc 都是一次完整的 USB 往返。
@@ -149,9 +199,11 @@ async fn main() -> anyhow::Result<()> {
                 Ok(raw) => {
                     if let Some(press) = button.sample(raw, now) {
                         state.advance();
+                        refresh_page(&ui, &state, &button);
+                        refresh_text(&ui, &state, signin_snapshot.as_ref());
                         println!(
                             "press page={} trigger={} baseline={}",
-                            state.page,
+                            state.label(),
                             press.trigger_raw,
                             button.baseline()
                         );
@@ -249,6 +301,21 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use course_signin::model::Course;
+    use signin::Snapshot;
+
+    fn sample_course(name: &str, begin: &str, end: &str, status: &str) -> Course {
+        Course {
+            id: name.to_owned(),
+            uuid: name.to_owned(),
+            course_name: name.to_owned(),
+            teacher_name: String::new(),
+            week_day: "1".to_owned(),
+            class_begin_time: format!("2099-01-01 {begin}:00"),
+            class_end_time: format!("2099-01-01 {end}:00"),
+            sign_status: status.to_owned(),
+        }
+    }
 
     #[test]
     fn renders_all_pages() {
@@ -265,22 +332,37 @@ mod tests {
         metrics.time = "14:32:07".to_owned();
         metrics.date = "2026-11-26".to_owned();
         metrics.cpu_percent = 23;
-        metrics.cpu_detail = "load 0.42".to_owned();
         metrics.mem_percent = 61;
-        metrics.mem_detail = "3.2 / 5.1 GB".to_owned();
         metrics.net_down = "1.2 MB/s".to_owned();
         metrics.net_up = "340 KB/s".to_owned();
 
+        let snapshot = Snapshot {
+            courses: vec![
+                sample_course("高等数学", "10:25", "12:00", "0"),
+                sample_course("大学物理", "14:00", "15:40", "0"),
+                sample_course("英语", "16:30", "18:00", "1"),
+                sample_course("体育", "18:30", "20:00", "0"),
+            ],
+            error: None,
+            updated: Some("09:01".to_owned()),
+        };
+
+        let mut state = AppState::new();
+        state.rebuild(Some(snapshot.courses.len()));
+
         std::fs::create_dir_all("target/msu2_dump").expect("dump dir");
 
-        for page in 0..PAGES {
-            refresh_page(&ui, &AppState { page }, &button);
+        // 概览 + 签到 + ceil(4/3) = 2 个课程页，共 4 页。
+        for page in 0..4 {
+            refresh_page(&ui, &state, &button);
             refresh_metrics(&ui, &metrics);
+            refresh_text(&ui, &state, Some(&snapshot));
             slint::platform::update_timers_and_animations();
             window.draw_if_needed(|renderer| {
                 renderer.render(&mut pixels, WIDTH);
             });
             write_bmp(&format!("target/msu2_dump/page{page}.bmp"), &pixels).expect("bmp");
+            state.advance();
         }
     }
 

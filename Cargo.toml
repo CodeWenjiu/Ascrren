@@ -17,3 +17,5 @@ thiserror = "2.0"
 anyhow = "1.0"
 libc = "0.2"
 slint = { version = "1.19", default-features = false, features = ["std", "renderer-software", "compat-1-2"] }
+chrono = "0.4"
+course-signin = { git = "https://github.com/CodeWenjiu/ucase_course_signin", package = "course-signin" }

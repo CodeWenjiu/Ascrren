@@ -10,16 +10,16 @@ Slint 通过 `MinimalSoftwareWindow` 软件渲染到 RGB565 framebuffer，程序
 
 ## 页面
 
-四页循环，触摸焊盘短按翻页，也可以定时自动轮播：
-
 | 页 | 内容 | 数据源 |
 |---|---|---|
-| 0 | 时钟 | `localtime_r` |
-| 1 | CPU 使用率 + 1 分钟负载 | `/proc/stat`、`/proc/loadavg` |
-| 2 | 内存占用 | `/proc/meminfo` |
-| 3 | 网络上下行速率 | `/sys/class/net/*/statistics` |
+| 概览 | 时间、日期、CPU、内存、网络速率 | `localtime_r`、`/proc`、`/sys` |
+| 签到 | 今日课程数、下一节课、更新时间 | iclass API |
+| 课程 N | 每页 3 门课，含时间和签到状态 | iclass API |
 
-系统指标每秒刷新一次，变化的部分才会上线。
+总页数 = 1 + （启用签到时）1 + ⌈今日课程数 / 3⌉。没有课就没有课程页；
+不传凭据就只有一页概览。
+
+系统指标每秒刷新一次，课表每小时拉取一次，变化的部分才会上线。
 
 ## 运行
 
@@ -29,6 +29,9 @@ cargo run -q -p msu2-slint
 
 # 跑 20 秒
 cargo run -q -p msu2-slint -- --duration-ms 20000
+
+# 启用课程签到页（只读，不会自动发起点名）
+cargo run -q -p msu2-slint -- --ucas-user 学号 --ucas-password 密码
 
 # 面板出现拖影时降低帧率
 cargo run -q -p msu2-slint -- --fps 30
@@ -45,6 +48,11 @@ cargo run -q -p msu2-slint -- --press-delta 80
 | `--fps` | 60 | 目标帧率 |
 | `--duration-ms` | 0 | 运行时长，0 表示直到 Ctrl-C |
 | `--press-delta` | 150 | 相对基线下降多少判定为按下 |
+| `--ucas-user` | 无 | 学号；提供后启用签到页 |
+| `--ucas-password` | `Ucas@2025` | 密码；省略时用上游默认初始密码 |
+
+> 命令行参数会出现在 `ps` 输出里。如果介意，可以用 shell 历史不记录的方式输入，
+> 或后续改成从权限 600 的文件读取。
 
 ## 实现要点
 

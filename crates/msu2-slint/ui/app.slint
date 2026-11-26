@@ -3,72 +3,67 @@ export component AppWindow inherits Window {
     height: 80px;
     background: #081018;
 
-    in property <int> page: 0;
+    // 0 = 概览，1 = 文本
+    in property <int> page-kind: 0;
     in property <bool> pressed: false;
+    in property <string> page-label: "1/1";
 
     in property <string> clock-time: "--:--:--";
     in property <string> clock-date: "----.--.--";
 
     in property <int> cpu-percent: 0;
-    in property <string> cpu-label: "CPU --%";
-    in property <string> cpu-detail: "";
-
+    in property <string> cpu-text: "--%";
     in property <int> mem-percent: 0;
-    in property <string> mem-label: "MEM --%";
-    in property <string> mem-detail: "";
-
+    in property <string> mem-text: "--%";
     in property <string> net-down: "0 B/s";
     in property <string> net-up: "0 B/s";
 
-    in property <[int]> dots: [0, 1, 2, 3];
+    in property <string> text-title: "";
+    in property <string> text-line1: "";
+    in property <string> text-line2: "";
+    in property <string> text-line3: "";
 
-    // 页 0：时钟
-    if root.page == 0 : Rectangle {
+    // 页 0：概览。左标签、中条形、右数值。
+    if root.page-kind == 0 : Rectangle {
         width: 160px;
         height: 80px;
         background: transparent;
 
         Text {
-            x: 0px;
-            y: 8px;
-            width: 160px;
-            horizontal-alignment: center;
+            x: 4px;
+            y: 0px;
+            width: 110px;
             text: root.clock-time;
             color: root.pressed ? #ffffff : #7fe7ff;
-            font-size: 30px;
+            font-size: 24px;
         }
 
         Text {
-            x: 0px;
-            y: 50px;
-            width: 160px;
-            horizontal-alignment: center;
+            x: 98px;
+            y: 14px;
+            width: 58px;
+            horizontal-alignment: right;
             text: root.clock-date;
-            color: #55707f;
-            font-size: 10px;
+            color: #4a6472;
+            font-size: 9px;
         }
-    }
 
-    // 页 1：CPU
-    if root.page == 1 : Rectangle {
-        width: 160px;
-        height: 80px;
-        background: transparent;
-
+        // CPU
         Text {
-            x: 0px;
-            y: 6px;
-            width: 160px;
-            horizontal-alignment: center;
-            text: root.cpu-label;
-            color: root.pressed ? #ffffff : #7fe7ff;
-            font-size: 20px;
+            x: 4px;
+            y: 31px;
+            width: 22px;
+            height: 11px;
+            vertical-alignment: center;
+            text: "CPU";
+            color: #6f96a8;
+            font-size: 9px;
         }
 
         Rectangle {
-            x: 12px;
-            y: 36px;
-            width: 136px;
+            x: 28px;
+            y: 33px;
+            width: 70px;
             height: 8px;
             border-radius: 4px;
             background: #162a38;
@@ -76,44 +71,41 @@ export component AppWindow inherits Window {
             Rectangle {
                 x: 0px;
                 y: 0px;
-                height: parent.height;
                 width: parent.width * root.cpu-percent / 100;
+                height: parent.height;
                 border-radius: 4px;
-                background: root.cpu-percent > 80 ? #ff6b6b : #37c8ff;
+                background: root.cpu-percent > 85 ? #ff6b6b : (root.cpu-percent > 60 ? #ffcc66 : #37c8ff);
             }
         }
 
         Text {
-            x: 0px;
-            y: 50px;
-            width: 160px;
-            horizontal-alignment: center;
-            text: root.cpu-detail;
-            color: #55707f;
-            font-size: 9px;
+            x: 102px;
+            y: 31px;
+            width: 54px;
+            height: 11px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            text: root.cpu-text;
+            color: #cdeef8;
+            font-size: 11px;
         }
-    }
 
-    // 页 2：内存
-    if root.page == 2 : Rectangle {
-        width: 160px;
-        height: 80px;
-        background: transparent;
-
+        // MEM
         Text {
-            x: 0px;
-            y: 6px;
-            width: 160px;
-            horizontal-alignment: center;
-            text: root.mem-label;
-            color: root.pressed ? #ffffff : #7fe7ff;
-            font-size: 20px;
+            x: 4px;
+            y: 44px;
+            width: 22px;
+            height: 11px;
+            vertical-alignment: center;
+            text: "MEM";
+            color: #6f96a8;
+            font-size: 9px;
         }
 
         Rectangle {
-            x: 12px;
-            y: 36px;
-            width: 136px;
+            x: 28px;
+            y: 46px;
+            width: 70px;
             height: 8px;
             border-radius: 4px;
             background: #162a38;
@@ -121,74 +113,101 @@ export component AppWindow inherits Window {
             Rectangle {
                 x: 0px;
                 y: 0px;
-                height: parent.height;
                 width: parent.width * root.mem-percent / 100;
+                height: parent.height;
                 border-radius: 4px;
-                background: root.mem-percent > 80 ? #ff6b6b : #37c8ff;
+                background: root.mem-percent > 85 ? #ff6b6b : (root.mem-percent > 60 ? #ffcc66 : #37c8ff);
             }
         }
 
         Text {
-            x: 0px;
-            y: 50px;
-            width: 160px;
-            horizontal-alignment: center;
-            text: root.mem-detail;
-            color: #55707f;
+            x: 102px;
+            y: 44px;
+            width: 54px;
+            height: 11px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            text: root.mem-text;
+            color: #cdeef8;
+            font-size: 11px;
+        }
+
+        // 网络
+        Text {
+            x: 4px;
+            y: 58px;
+            width: 76px;
+            text: "↓ " + root.net-down;
+            color: #8ab0c0;
+            font-size: 9px;
+        }
+
+        Text {
+            x: 80px;
+            y: 58px;
+            width: 76px;
+            horizontal-alignment: right;
+            text: "↑ " + root.net-up;
+            color: #8ab0c0;
             font-size: 9px;
         }
     }
 
-    // 页 3：网络
-    if root.page == 3 : Rectangle {
+    // 页 1：文本（签到状态 / 课程列表）
+    if root.page-kind == 1 : Rectangle {
         width: 160px;
         height: 80px;
         background: transparent;
 
         Text {
             x: 0px;
-            y: 4px;
+            y: 0px;
             width: 160px;
             horizontal-alignment: center;
-            text: "NET";
+            text: root.text-title;
             color: root.pressed ? #ffffff : #7fe7ff;
-            font-size: 18px;
+            font-size: 17px;
         }
 
         Text {
             x: 0px;
-            y: 30px;
+            y: 22px;
             width: 160px;
             horizontal-alignment: center;
-            text: "DOWN  " + root.net-down;
-            color: #55707f;
-            font-size: 10px;
+            text: root.text-line1;
+            color: #e6f6fc;
+            font-size: 12px;
         }
 
         Text {
             x: 0px;
-            y: 48px;
+            y: 39px;
             width: 160px;
             horizontal-alignment: center;
-            text: "UP    " + root.net-up;
-            color: #55707f;
-            font-size: 10px;
+            text: root.text-line2;
+            color: #cdeef8;
+            font-size: 12px;
+        }
+
+        Text {
+            x: 0px;
+            y: 56px;
+            width: 160px;
+            horizontal-alignment: center;
+            text: root.text-line3;
+            color: #8ab0c0;
+            font-size: 12px;
         }
     }
 
     // 页码
-    HorizontalLayout {
-        x: 0px;
-        y: 68px;
-        width: 160px;
-        alignment: center;
-        spacing: 6px;
-
-        for dot[index] in root.dots : Rectangle {
-            width: 5px;
-            height: 5px;
-            border-radius: 3px;
-            background: index == root.page ? #37c8ff : #1b2c36;
-        }
+    Text {
+        x: 110px;
+        y: 69px;
+        width: 46px;
+        horizontal-alignment: right;
+        text: root.page-label;
+        color: #2f4a59;
+        font-size: 8px;
     }
 }
