@@ -18,6 +18,7 @@ use msu2_core::{ButtonConfig, ButtonState};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel};
 
 mod app;
+mod autosign;
 mod metrics;
 mod signin;
 mod usb;
@@ -69,6 +70,10 @@ pub(crate) struct Cli {
     /// UCAS 密码；省略时使用默认初始密码
     #[arg(long)]
     pub(crate) ucas_password: Option<String>,
+
+    /// 关闭自动签到（提供 `--ucas-user` 时默认开启）
+    #[arg(long)]
+    pub(crate) no_auto_sign: bool,
 }
 
 #[tokio::main]
@@ -98,8 +103,23 @@ async fn main() -> anyhow::Result<()> {
                 .clone()
                 .unwrap_or_else(|| course_signin::config::DEFAULT_PASSWORD.to_owned());
             let (tx, rx) = tokio::sync::mpsc::channel(4);
-            signin::spawn(user.clone(), password, tx);
-            println!("sign-in enabled for {user}");
+            let auto_sign = !cli.no_auto_sign;
+            signin::spawn(
+                signin::Config {
+                    user: user.clone(),
+                    password,
+                    auto_sign,
+                },
+                tx,
+            );
+            println!(
+                "sign-in enabled for {user} (auto sign-in {})",
+                if auto_sign {
+                    "on"
+                } else {
+                    "off (--no-auto-sign)"
+                }
+            );
             Some(rx)
         }
         None => {
@@ -345,6 +365,7 @@ mod tests {
             ],
             error: None,
             updated: Some("09:01".to_owned()),
+            event: Some("已签 英语".to_owned()),
         };
 
         let mut state = AppState::new();

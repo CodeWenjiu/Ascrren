@@ -160,8 +160,11 @@ fn signin_lines(
         );
     };
 
-    if let Some(error) = &snapshot.error {
-        return (title, short(error, 14), String::new(), String::new());
+    // 从来没有拉到过课表时，直接把错误显示出来。
+    if snapshot.courses.is_empty()
+        && let Some(error) = &snapshot.error
+    {
+        return (title, short(error, 12), String::new(), String::new());
     }
 
     let remaining = signin::upcoming(&snapshot.courses, now).len();
@@ -176,11 +179,17 @@ fn signin_lines(
         None => String::from("今日无课"),
     };
 
-    let line3 = snapshot
-        .updated
-        .as_ref()
-        .map(|time| format!("更新 {time}"))
-        .unwrap_or_default();
+    let line3 = if let Some(event) = &snapshot.event {
+        event.clone()
+    } else if snapshot.error.is_some() {
+        String::from("课表刷新失败")
+    } else {
+        snapshot
+            .updated
+            .as_ref()
+            .map(|time| format!("更新 {time}"))
+            .unwrap_or_default()
+    };
 
     (title, line1, line2, line3)
 }
@@ -286,6 +295,45 @@ mod tests {
         let (title, line1, _, _) = signin_lines(Some(&snapshot), now);
         assert_eq!(title, "SIGNIN");
         assert!(line1.contains("登录失败"));
+    }
+
+    #[test]
+    fn signin_lines_show_the_latest_event() {
+        let snapshot = Snapshot {
+            courses: vec![course(
+                "高等数学",
+                "2026-03-25 10:25:00",
+                "2026-03-25 12:00:00",
+                "1",
+            )],
+            updated: Some("09:01".to_owned()),
+            event: Some("已签 高等数学".to_owned()),
+            ..Snapshot::default()
+        };
+        let now = NaiveDateTime::parse_from_str("2026-03-25 10:30:00", "%Y-%m-%d %H:%M:%S")
+            .expect("time");
+        let (_, _, _, line3) = signin_lines(Some(&snapshot), now);
+        assert_eq!(line3, "已签 高等数学");
+    }
+
+    #[test]
+    fn keeps_showing_stale_courses_when_a_refresh_fails() {
+        let snapshot = Snapshot {
+            courses: vec![course(
+                "高等数学",
+                "2026-03-25 10:25:00",
+                "2026-03-25 12:00:00",
+                "0",
+            )],
+            error: Some("课表请求失败".to_owned()),
+            updated: Some("09:01".to_owned()),
+            ..Snapshot::default()
+        };
+        let now = NaiveDateTime::parse_from_str("2026-03-25 09:00:00", "%Y-%m-%d %H:%M:%S")
+            .expect("time");
+        let (_, line1, _, line3) = signin_lines(Some(&snapshot), now);
+        assert_eq!(line1, "今日 1 节课");
+        assert_eq!(line3, "课表刷新失败");
     }
 
     #[test]

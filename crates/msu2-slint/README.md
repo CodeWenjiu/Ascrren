@@ -13,7 +13,7 @@ Slint 通过 `MinimalSoftwareWindow` 软件渲染到 RGB565 framebuffer，程序
 | 页 | 内容 | 数据源 |
 |---|---|---|
 | 概览 | 时间、日期、CPU、内存、网络速率 | `localtime_r`、`/proc`、`/sys` |
-| 签到 | 今日课程数、下一节课、更新时间 | iclass API |
+| 签到 | 今日课程数、下一节课、最近签到事件 | iclass API |
 | 课程 N | 每页 3 门课，含时间和签到状态 | iclass API |
 
 总页数 = 1 + （启用签到时）1 + ⌈今日课程数 / 3⌉。没有课就没有课程页；
@@ -30,8 +30,11 @@ cargo run -q -p msu2-slint
 # 跑 20 秒
 cargo run -q -p msu2-slint -- --duration-ms 20000
 
-# 启用课程签到页（只读，不会自动发起点名）
+# 启用签到页与自动签到
 cargo run -q -p msu2-slint -- --ucas-user 学号 --ucas-password 密码
+
+# 只看课表，不自动签到
+cargo run -q -p msu2-slint -- --ucas-user 学号 --no-auto-sign
 
 # 面板出现拖影时降低帧率
 cargo run -q -p msu2-slint -- --fps 30
@@ -50,15 +53,30 @@ cargo run -q -p msu2-slint -- --press-delta 80
 | `--press-delta` | 150 | 相对基线下降多少判定为按下 |
 | `--ucas-user` | 无 | 学号；提供后启用签到页 |
 | `--ucas-password` | `Ucas@2025` | 密码；省略时用上游默认初始密码 |
+| `--no-auto-sign` | 关闭 | 只展示课表，不自动签到 |
 
 > 命令行参数会出现在 `ps` 输出里。如果介意，可以用 shell 历史不记录的方式输入，
 > 或后续改成从权限 600 的文件读取。
+
+## 自动签到
+
+提供 `--ucas-user` 时默认开启，`--no-auto-sign` 关闭。规则与上游
+`course-signin-tui` 一致：
+
+- 签到窗口在**上课前 1~5 分钟随机**开启，一直持续到下课
+- 窗口内失败每 **60 秒**重试一次，下课后放弃
+- 已签到（上游 `signStatus=1` 或本次运行中成功）的课不会重复签
+- 课表每小时刷新一次，失败时 5 分钟后重试；刷新不会清掉已成功的记录
+- 会话过期时下一次请求会自动重新登录
+
+签到页第三行显示最近一次事件（`已签 高等数学`、`高等数学 重试中`），
+成功后课程页的状态立即变成「已签」。
 
 ## 实现要点
 
 - **首帧**用 `display_frame` 发全屏，之后只发差分
 - **断线重连**：读写失败后按 0.5s → 5s 退避重连，成功后重发全屏并重新校准触摸
-- **自适应采样**：空闲时 15 Hz，按住或等待电平恢复时 30 Hz；采样同时充当保活
+- **自适应采样**：空闲时 30 Hz，按住或等待电平恢复时 60 Hz；采样同时充当保活
 - **触摸识别**：强信号（下降 ≥ 300）单次采样触发，弱信号 2 次去抖；迟滞防止在阈值附近翻转
 - **回弹防护**：松手后必须看到电平回到安静区间并保持 3 次，才允许下一次按下；5 秒超时兜底
 - **误码过滤**：偏离基线超过 2000 的采样直接丢弃
@@ -68,8 +86,7 @@ cargo run -q -p msu2-slint -- --press-delta 80
 ## 换成自己的界面
 
 编辑 `ui/app.slint`。它就是一个普通的 Slint 组件，宽高固定 160×80，`build.rs` 会在编译期
-把它生成为 `AppWindow`。页面数量由 `src/main.rs` 的 `PAGES` 和 `.slint` 里的 `dots`
-数组共同决定。
+把它生成为 `AppWindow`。页面类型和页数由 `src/app.rs` 的 `PageKind` / `AppState` 决定。
 
 数据采集在 `src/metrics.rs`，想加新的指标（磁盘、温度、天气）只要往 `Metrics`
 里加字段，再在 `.slint` 里加一页。
